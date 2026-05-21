@@ -53,6 +53,60 @@ _PYTHON_FRAMEWORKS: dict[str, tuple[str, str]] = {
 }
 
 
+# Maximum directory depth from the repo root to scan for .NET project
+# files. Five levels covers every observed .NET monorepo layout in the
+# wild (e.g. `src/<area>/<module>/<Project>/<Project>.csproj` is depth
+# 4; `services/<svc>/src/<Project>/<Project>.csproj` is depth 5).
+# Setting this higher would only add noise from samples / tests buried
+# inside generated SDK folders.
+_DOTNET_MAX_DEPTH = 5
+
+# Hard cap on returned .csproj count. Repos like dotnet/runtime have
+# thousands of project files; we only need a representative sample to
+# infer the tech stack.
+_DOTNET_MAX_PROJECTS = 200
+
+# Directory names to prune from the scan. These never host real
+# project source and bloat the walk on Windows where `bin/obj`
+# contains thousands of intermediate files per project.
+_DOTNET_PRUNE = frozenset({
+    "bin", "obj", ".vs", "node_modules", ".git", "packages",
+    ".idea", "artifacts", ".build", "TestResults",
+})
+
+
+def _find_dotnet_projects(repo_path: Path) -> list[Path]:
+    """Return up to ``_DOTNET_MAX_PROJECTS`` .csproj files under *repo_path*.
+
+    Bounded depth-first walk that prunes build-output and tooling
+    directories. Order is depth-first but stable across runs (sorted
+    children at each level) so caching downstream is deterministic.
+    """
+    found: list[Path] = []
+
+    def _walk(current: Path, depth: int) -> None:
+        if len(found) >= _DOTNET_MAX_PROJECTS:
+            return
+        if depth > _DOTNET_MAX_DEPTH:
+            return
+        try:
+            entries = sorted(current.iterdir(), key=lambda p: p.name.lower())
+        except (OSError, PermissionError):
+            return
+        for entry in entries:
+            if len(found) >= _DOTNET_MAX_PROJECTS:
+                return
+            if entry.is_dir():
+                if entry.name in _DOTNET_PRUNE or entry.name.startswith("."):
+                    continue
+                _walk(entry, depth + 1)
+            elif entry.is_file() and entry.suffix == ".csproj":
+                found.append(entry)
+
+    _walk(repo_path, 0)
+    return found
+
+
 def detect_tech_stack(repo_path: Path) -> list[TechStackItem]:
     """Detect languages, frameworks, and infra tools from manifest files.
 
@@ -66,23 +120,49 @@ def detect_tech_stack(repo_path: Path) -> list[TechStackItem]:
             items[name] = TechStackItem(name=name, version=version, category=category)
 
     # --- package.json (Node.js) ---
+    # Many .NET / Python / Go repos drop a package.json at the root for
+    # tooling like Playwright or Husky without being Node.js applications.
+    # We only register Node.js as a language when there is real evidence
+    # of a Node.js runtime: a ``main``/``bin`` field, runtime
+    # ``dependencies``, or a known framework dep.
     pkg_json = repo_path / "package.json"
+    pkg: dict[str, object] | None = None
     if pkg_json.exists():
         try:
             pkg = json.loads(pkg_json.read_text(encoding="utf-8"))
-            # Detect Node version from engines field
-            node_ver = pkg.get("engines", {}).get("node")
+        except Exception:
+            pkg = None
+
+    if isinstance(pkg, dict):
+        runtime_deps = pkg.get("dependencies") or {}
+        dev_deps = pkg.get("devDependencies") or {}
+        all_deps = {**runtime_deps, **dev_deps}
+        node_ver = (pkg.get("engines") or {}).get("node") if isinstance(pkg.get("engines"), dict) else None
+        # Tooling-only manifests (e.g. .NET / Python repos that drop a
+        # package.json for Playwright or Husky) declare no runtime
+        # dependencies, no entry-point fields, and no engines hint. We
+        # gate the "Node.js" language tag on at least one of those
+        # signals to keep them from being labelled Node.js apps.
+        has_runtime_signal = bool(
+            runtime_deps
+            or pkg.get("main")
+            or pkg.get("bin")
+            or pkg.get("module")
+            or pkg.get("exports")
+            or node_ver
+        )
+        has_framework_dep = any(dep_key in all_deps for dep_key in _NODE_FRAMEWORKS)
+        if has_runtime_signal or has_framework_dep:
             add("Node.js", node_ver, "language")
-            all_deps = {**pkg.get("dependencies", {}), **pkg.get("devDependencies", {})}
             for dep_key, (display, cat) in _NODE_FRAMEWORKS.items():
                 if dep_key in all_deps:
                     raw = all_deps[dep_key].lstrip("^~>=")
                     add(display, raw or None, cat)
-            if "typescript" in all_deps or (repo_path / "tsconfig.json").exists():
-                ts_ver = all_deps.get("typescript", "").lstrip("^~>=") or None
-                add("TypeScript", ts_ver, "language")
-        except Exception:
-            pass
+        # TypeScript can be added independently — many monorepos only use
+        # TS via tsconfig.json without depending on a Node.js runtime.
+        if "typescript" in all_deps or (repo_path / "tsconfig.json").exists():
+            ts_ver = all_deps.get("typescript", "").lstrip("^~>=") or None
+            add("TypeScript", ts_ver, "language")
 
     # --- pyproject.toml / setup.py (Python) ---
     pyproject = repo_path / "pyproject.toml"
@@ -119,8 +199,86 @@ def detect_tech_stack(repo_path: Path) -> list[TechStackItem]:
         add("Ruby", None, "language")
 
     # --- composer.json (PHP) ---
-    if (repo_path / "composer.json").exists():
+    composer_json = repo_path / "composer.json"
+    if composer_json.exists():
         add("PHP", None, "language")
+        try:
+            composer = json.loads(composer_json.read_text(encoding="utf-8"))
+        except Exception:
+            composer = None
+        if isinstance(composer, dict):
+            requires = {
+                **(composer.get("require") or {}),
+                **(composer.get("require-dev") or {}),
+            }
+            if (
+                composer.get("type") == "typo3-cms-extension"
+                or "typo3/cms-core" in requires
+            ):
+                add("TYPO3", None, "framework")
+            elif "symfony/framework-bundle" in requires or "symfony/symfony" in requires:
+                add("Symfony", None, "framework")
+            elif "laravel/framework" in requires:
+                add("Laravel", None, "framework")
+
+    # --- .NET / C# (.csproj / .sln / Directory.Build.props) ---
+    # Walk the tree (bounded) so monorepos whose projects live under
+    # `src/modules/<module>/<Module>.csproj` or `services/foo/foo.csproj`
+    # still register. A shallow glob misses every real-world .NET
+    # monorepo layout — eShop, Aspire samples, PowerToys, Roslyn etc.
+    csproj_files = _find_dotnet_projects(repo_path)
+    sln_files = list(repo_path.glob("*.sln")) + list(repo_path.glob("*/*.sln"))
+    has_directory_build = (repo_path / "Directory.Build.props").exists() or (
+        repo_path / "Directory.Packages.props"
+    ).exists()
+    if csproj_files or sln_files or has_directory_build:
+        # Pull TargetFramework from the first .csproj — captures net9.0,
+        # net8.0, etc. Best-effort regex; the .csproj XML is small so a
+        # full parser would be overkill.
+        target_fw: str | None = None
+        for csproj in csproj_files[:10]:
+            try:
+                ctext = csproj.read_text(encoding="utf-8", errors="ignore")
+            except OSError:
+                continue
+            m = re.search(
+                r"<TargetFrameworks?>\s*([^<;]+)", ctext
+            )
+            if m:
+                target_fw = m.group(1).strip()
+                break
+        add("C#", target_fw, "language")
+        add(".NET", target_fw, "framework")
+        # Common .NET stack indicators read from any .csproj text. The
+        # cap is per-file, not per-byte — small projects with many
+        # csprojs (PowerToys ~140, Roslyn ~300) need a generous limit
+        # before they look like an unflavoured .NET repo.
+        joined_csproj = ""
+        for csproj in csproj_files[:80]:
+            try:
+                joined_csproj += csproj.read_text(encoding="utf-8", errors="ignore")
+            except OSError:
+                continue
+        if "Microsoft.AspNetCore" in joined_csproj:
+            add("ASP.NET Core", None, "framework")
+        if "Microsoft.EntityFrameworkCore" in joined_csproj:
+            add("Entity Framework Core", None, "database")
+        if "Aspire.Hosting" in joined_csproj or any(
+            "AppHost" in p.stem for p in csproj_files
+        ):
+            add(".NET Aspire", None, "infra")
+        if "Grpc.AspNetCore" in joined_csproj or "Google.Protobuf" in joined_csproj:
+            add("gRPC", None, "framework")
+        if "MAUI" in joined_csproj.upper() or any(
+            "Maui" in p.stem for p in csproj_files
+        ):
+            add(".NET MAUI", None, "framework")
+        if "Microsoft.WindowsAppSDK" in joined_csproj or "Microsoft.UI.Xaml" in joined_csproj:
+            add("WinUI 3", None, "framework")
+        if "Microsoft.NET.Sdk.WindowsDesktop" in joined_csproj or "<UseWPF>true" in joined_csproj:
+            add("WPF", None, "framework")
+        if "Microsoft.NET.Sdk.WindowsDesktop" in joined_csproj and "<UseWindowsForms>true" in joined_csproj:
+            add("Windows Forms", None, "framework")
 
     # --- Docker ---
     if (repo_path / "Dockerfile").exists():

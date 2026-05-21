@@ -3,6 +3,17 @@
  * Source of truth: packages/server/src/repowise/server/schemas.py
  */
 
+/**
+ * Pagination envelope returned by list endpoints. Mirrors
+ * ``repowise.server.schemas.Paginated[T]``.
+ */
+export interface Paginated<T> {
+  items: T[];
+  total: number;
+  has_more: boolean;
+  next_offset: number | null;
+}
+
 // ---------------------------------------------------------------------------
 // Repository
 // ---------------------------------------------------------------------------
@@ -35,6 +46,14 @@ export interface RepoResponse {
   settings: Record<string, unknown>;
   created_at: string;
   updated_at: string;
+  // Workspace mode (optional — only populated when the server runs in
+  // workspace mode). Unindexed repos appear as synthetic rows with
+  // `id="ws:<alias>"` and `workspace_status === "needs_index"`.
+  workspace_alias?: string | null;
+  workspace_status?: "indexed" | "needs_index" | "missing_dir" | null;
+  is_primary?: boolean | null;
+  docs_enabled?: boolean | null;
+  docs_skip_reason?: string | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -145,6 +164,14 @@ export interface SearchResultResponse {
 // Symbols
 // ---------------------------------------------------------------------------
 
+export interface SymbolImportanceComponents {
+  file_pagerank: number;
+  visibility_factor: number;
+  complexity_norm: number;
+  kind_boost: number;
+  is_entry_point: boolean;
+}
+
 export interface SymbolResponse {
   id: string;
   repository_id: string;
@@ -162,6 +189,12 @@ export interface SymbolResponse {
   complexity_estimate: number;
   language: string;
   parent_name: string | null;
+  importance_score?: number | null;
+  importance_components?: SymbolImportanceComponents | null;
+  file_pagerank?: number | null;
+  is_entry_point?: boolean | null;
+  file_churn_percentile?: number | null;
+  file_is_hotspot?: boolean | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -179,6 +212,13 @@ export interface GraphNodeResponse {
   is_test: boolean;
   is_entry_point: boolean;
   has_doc: boolean;
+  // Phase A: cross-link signals (all optional for back-compat)
+  is_hotspot?: boolean;
+  churn_percentile?: number | null;
+  is_dead?: boolean;
+  dead_confidence?: number | null;
+  has_decision?: boolean;
+  primary_owner?: string | null;
 }
 
 export interface GraphEdgeResponse {
@@ -190,6 +230,35 @@ export interface GraphEdgeResponse {
 export interface GraphExportResponse {
   nodes: GraphNodeResponse[];
   links: GraphEdgeResponse[];
+  /** Server set this true when the response was capped to top-N by PageRank. */
+  truncated?: boolean;
+  total_node_count?: number;
+}
+
+// Architecture super-node graph (Phase A)
+export interface ArchitectureNodeResponse {
+  community_id: number;
+  label: string;
+  cohesion: number;
+  member_count: number;
+  top_file: string;
+  avg_pagerank: number;
+  hotspot_count: number;
+  dead_count: number;
+  has_decision: boolean;
+  doc_coverage_pct: number;
+  languages: string[];
+}
+
+export interface ArchitectureEdgeResponse {
+  source: number;
+  target: number;
+  edge_count: number;
+}
+
+export interface ArchitectureGraphResponse {
+  nodes: ArchitectureNodeResponse[];
+  edges: ArchitectureEdgeResponse[];
 }
 
 export interface GraphPathResponse {
@@ -410,11 +479,15 @@ export interface GitMetadataResponse {
 
 export interface HotspotResponse {
   file_path: string;
+  commit_count_total?: number;
   commit_count_90d: number;
   commit_count_30d: number;
   churn_percentile: number;
   temporal_hotspot_score?: number | null;
   primary_owner: string | null;
+  primary_owner_commit_pct?: number | null;
+  recent_owner_name?: string | null;
+  recent_owner_commit_pct?: number | null;
   is_hotspot: boolean;
   is_stable: boolean;
   bus_factor: number;
@@ -423,6 +496,10 @@ export interface HotspotResponse {
   lines_deleted_90d: number;
   avg_commit_size: number;
   commit_categories: Record<string, number>;
+  merge_commit_count_90d?: number;
+  commit_count_capped?: boolean;
+  age_days?: number;
+  last_commit_at?: string | null;
 }
 
 export interface OwnershipEntry {
@@ -515,8 +592,10 @@ export interface DecisionCreate {
 }
 
 export interface DecisionStatusUpdate {
-  status: string;
+  status?: string;
   superseded_by?: string;
+  affected_modules?: string[];
+  affected_files?: string[];
 }
 
 export interface DecisionHealthResponse {
@@ -644,6 +723,22 @@ export interface WorkspaceRepoEntry {
   page_count: number;
   doc_coverage_pct: number;
   hotspot_count: number;
+  // Phase B server augmentation
+  status?: "indexed" | "needs_index" | "missing_dir" | null;
+  docs_enabled?: boolean | null;
+  docs_skip_reason?: string | null;
+}
+
+export interface WorkspaceSyncResult {
+  alias: string;
+  repo_id: string | null;
+  status: "accepted" | "skipped" | "error";
+  job_id: string | null;
+  reason: string | null;
+}
+
+export interface WorkspaceSyncResponse {
+  results: WorkspaceSyncResult[];
 }
 
 export interface WorkspaceCrossRepoSummary {
@@ -713,4 +808,144 @@ export interface WorkspaceCoChangeEntry {
 export interface WorkspaceCoChangesResponse {
   co_changes: WorkspaceCoChangeEntry[];
   total: number;
+}
+
+export interface WorkspaceGraphNode {
+  repo_id: string;
+  name: string;
+  file_count: number;
+  coverage_pct: number;
+  health_score: number;
+  top_language: string;
+}
+
+export interface WorkspaceGraphEdge {
+  source: string;
+  target: string;
+  type: "contract" | "co_change";
+  strength: number;
+  label: string | null;
+}
+
+export interface WorkspaceGraphResponse {
+  nodes: WorkspaceGraphNode[];
+  edges: WorkspaceGraphEdge[];
+}
+
+// ---------------------------------------------------------------------------
+// Owner / contributor profile
+// ---------------------------------------------------------------------------
+
+export interface OwnerListEntry {
+  key: string;
+  name: string;
+  email: string | null;
+  files_owned: number;
+  hotspots_owned: number;
+  silo_modules: number;
+  dead_code_files_owned: number;
+  dead_code_lines_owned: number;
+  commit_count_90d: number;
+  last_commit_at: string | null;
+  bus_factor_risk_files: number;
+}
+
+export interface OwnerModuleRollup {
+  module_path: string;
+  file_count: number;
+  hotspot_count: number;
+  dominant_pct: number;
+}
+
+export interface OwnerFileEntry {
+  file_path: string;
+  commit_count_90d: number;
+  churn_percentile: number;
+  bus_factor: number;
+  is_hotspot: boolean;
+  last_commit_at: string | null;
+  primary_owner_commit_pct: number | null;
+}
+
+export interface OwnerCoAuthor {
+  name: string;
+  email: string | null;
+  shared_files: number;
+  co_change_strength: number;
+}
+
+export interface OwnerProfileResponse {
+  key: string;
+  name: string;
+  email: string | null;
+  files_owned: number;
+  hotspots_owned: number;
+  silo_modules: number;
+  dead_code_files_owned: number;
+  dead_code_lines_owned: number;
+  commit_count_90d: number;
+  last_commit_at: string | null;
+  first_commit_at: string | null;
+  bus_factor_risk_files: number;
+  lines_added_90d_est: number;
+  lines_deleted_90d_est: number;
+  modules: OwnerModuleRollup[];
+  top_files: OwnerFileEntry[];
+  co_authors: OwnerCoAuthor[];
+  commit_categories: Record<string, number>;
+}
+
+// ---------------------------------------------------------------------------
+// Module health
+// ---------------------------------------------------------------------------
+
+export interface ModuleHealthOwner {
+  name: string;
+  email: string | null;
+  file_count: number;
+  pct: number;
+}
+
+export interface ModuleHealthSummary {
+  module_path: string;
+  file_count: number;
+  symbol_count: number;
+  hotspot_count: number;
+  dead_code_count: number;
+  dead_code_lines: number;
+  avg_churn_percentile: number;
+  median_bus_factor: number;
+  min_bus_factor: number;
+  primary_owner: string | null;
+  primary_owner_pct: number;
+  is_silo: boolean;
+  decision_count: number;
+  doc_coverage_pct: number;
+  health_score: number;
+}
+
+export interface ModuleHealthDetail extends ModuleHealthSummary {
+  owners: ModuleHealthOwner[];
+  top_hotspots: string[];
+  governing_decisions: string[];
+  contributor_count: number;
+}
+
+// ---------------------------------------------------------------------------
+// Reviewer suggestions
+// ---------------------------------------------------------------------------
+
+export interface ReviewerSuggestion {
+  name: string;
+  email: string | null;
+  score: number;
+  recent_commits: number;
+  owned_paths: string[];
+  co_change_paths: string[];
+  reasons: string[];
+}
+
+export interface ReviewerSuggestionsResponse {
+  paths: string[];
+  suggestions: ReviewerSuggestion[];
 }

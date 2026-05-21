@@ -4,17 +4,17 @@ import { useState } from "react";
 import { toast } from "sonner";
 import { RefreshCw, Zap, ChevronDown, ChevronUp, AlertTriangle, Download } from "lucide-react";
 import { syncRepo, fullResyncRepo } from "@/lib/api/repos";
-import { Button } from "@/components/ui/button";
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Button } from "@repowise-dev/ui/ui/button";
+import { Card, CardContent, CardHeader, CardTitle } from "@repowise-dev/ui/ui/card";
 import {
   Dialog,
   DialogContent,
   DialogHeader,
   DialogTitle,
   DialogFooter,
-} from "@/components/ui/dialog";
+} from "@repowise-dev/ui/ui/dialog";
 import { RunConfigForm, type RunConfig } from "./run-config-form";
-import { GenerationProgress } from "@/components/jobs/generation-progress";
+import { GenerationProgressWrapper as GenerationProgress } from "@/components/jobs/generation-progress-wrapper";
 
 interface Props {
   repoId: string;
@@ -79,7 +79,9 @@ export function OperationsPanel({ repoId, repoName }: Props) {
             <CardTitle className="text-sm">Operations</CardTitle>
             <button
               onClick={() => setOpen((v) => !v)}
-              className="flex items-center gap-1 text-xs text-[var(--color-text-tertiary)] hover:text-[var(--color-text-secondary)] transition-colors"
+              aria-expanded={open}
+              aria-controls="operations-panel-content"
+              className="flex items-center gap-1 text-xs text-[var(--color-text-tertiary)] hover:text-[var(--color-text-secondary)] transition-colors cursor-pointer"
             >
               {open ? <ChevronUp className="h-3.5 w-3.5" /> : <ChevronDown className="h-3.5 w-3.5" />}
               {open ? "Collapse" : "Configure"}
@@ -87,7 +89,7 @@ export function OperationsPanel({ repoId, repoName }: Props) {
           </div>
         </CardHeader>
 
-        <CardContent className="space-y-4">
+        <CardContent id="operations-panel-content" className="space-y-4">
           {/* Active job progress */}
           {activeJobId && (
             <GenerationProgress

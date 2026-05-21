@@ -219,7 +219,23 @@ def print_scan_summary(console: Console, scan: RepoScanInfo) -> None:
         lang_parts.append(f"+{len(source_langs) - 4} more")
     lang_line = ", ".join(lang_parts) if lang_parts else "no source files detected"
 
-    body = f"  {header_line}\n  [dim]{lang_line}[/dim]"
+    # Rough wall-time estimate so users know what they're committing to.
+    # Calibrated against ~700-file Python+TS repos: traverse+parse+graph
+    # comes in around 2 min/1k source files, plus ~1 min/100 LLM pages.
+    # We surface a range, not a point, to set honest expectations.
+    src_files = sum(source_langs.values()) or scan.total_files
+    ingest_min = max(1, round(src_files / 500))
+    ingest_max = max(2, round(src_files / 250))
+    eta_line = (
+        f"~{ingest_min}-{ingest_max} min ingestion"
+        " · LLM generation depends on model + page count"
+    )
+
+    body = (
+        f"  {header_line}\n"
+        f"  [dim]{lang_line}[/dim]\n"
+        f"  [dim]{eta_line}[/dim]"
+    )
 
     console.print(
         Panel(
@@ -262,9 +278,11 @@ def print_phase_header(
 
 _PROVIDER_DEFAULTS: dict[str, str] = {
     "gemini": "gemini-3.1-flash-lite-preview",
-    "openai": "gpt-4.1",
+    "openai": "gpt-5.4-nano",
     "anthropic": "claude-sonnet-4-6",
+    "deepseek": "deepseek-v4-flash",
     "ollama": "llama3.2",
+    "openrouter": "anthropic/claude-sonnet-4.6",
     "litellm": "groq/llama-3.1-70b-versatile",
 }
 
@@ -272,14 +290,18 @@ _PROVIDER_ENV: dict[str, str] = {
     "gemini": "GEMINI_API_KEY",
     "openai": "OPENAI_API_KEY",
     "anthropic": "ANTHROPIC_API_KEY",
+    "deepseek": "DEEPSEEK_API_KEY",
     "ollama": "OLLAMA_BASE_URL",
+    "openrouter": "OPENROUTER_API_KEY",
 }
 
 _PROVIDER_SIGNUP: dict[str, str] = {
     "gemini": "https://aistudio.google.com/apikey",
     "openai": "https://platform.openai.com/api-keys",
     "anthropic": "https://console.anthropic.com/settings/keys",
+    "deepseek": "https://platform.deepseek.com/api_keys",
     "ollama": "https://ollama.com/download",
+    "openrouter": "https://openrouter.ai/keys",
 }
 
 
@@ -289,19 +311,46 @@ _PROVIDER_SIGNUP: dict[str, str] = {
 
 
 def load_dotenv(repo_path: Path) -> None:
-    """Load ``<repo>/.repowise/.env`` into ``os.environ`` (without overwriting)."""
+    """Load ``<repo>/.repowise/.env`` into ``os.environ`` (without overwriting).
+
+    Supports ``export KEY=value``, quoted values (``KEY="value"``, ``KEY='value'``),
+    and inline comments (``KEY=value  # comment``).
+    """
     env_file = repo_path / ".repowise" / ".env"
     if not env_file.exists():
         return
     for line in env_file.read_text(encoding="utf-8").splitlines():
         line = line.strip()
-        if not line or line.startswith("#") or "=" not in line:
+        if not line or line.startswith("#"):
             continue
-        key, _, value = line.partition("=")
-        key, value = key.strip(), value.strip()
+        # Support `export KEY=value`
+        if line.startswith("export "):
+            line = line[len("export "):].lstrip()
+        if "=" not in line:
+            continue
+        key, _, raw_value = line.partition("=")
+        key = key.strip()
+        # Strip inline comments from the value (e.g. "sk-xxx  # my key")
+        raw_value = raw_value.strip()
+        if "#" in raw_value:
+            # Only strip if # is preceded by whitespace (avoid stripping # in URLs)
+            hash_idx = raw_value.find(" #")
+            if hash_idx == -1:
+                hash_idx = raw_value.find("\t#")
+            if hash_idx >= 0:
+                raw_value = raw_value[:hash_idx].rstrip()
+        # Strip matching surrounding quotes
+        value = _strip_quotes(raw_value)
         # Don't overwrite existing env vars (explicit env takes priority)
         if key and value and key not in os.environ:
             os.environ[key] = value
+
+
+def _strip_quotes(value: str) -> str:
+    """Strip one pair of matching surrounding single or double quotes."""
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in ('"', "'"):
+        return value[1:-1]
+    return value
 
 
 def _save_key_to_dotenv(repo_path: Path, env_var: str, value: str) -> None:
@@ -487,12 +536,38 @@ def interactive_provider_select(
 
     # --- model ---
     default_model = _PROVIDER_DEFAULTS.get(chosen, "")
+    if not model_flag:
+        console.print(
+            "  [dim]↳ Smaller is fine — repowise is calibrated for "
+            "flash-lite / nano / haiku / 8B-class ollama. Bigger models "
+            "don't improve doc quality.[/]"
+        )
     model = model_flag or click.prompt(
         "  Model",
         default=default_model,
     )
 
+    if not model_flag and _is_flagship_model(model):
+        console.print(
+            f"  [{WARN}]Note:[/] [dim]'{model}' works, but flash-lite / haiku / "
+            "nano produce equivalent docs at ~10x lower cost on most repos.[/]"
+        )
+
     return chosen, model
+
+
+_FLAGSHIP_MODEL_TOKENS = (
+    "opus", "gpt-4o", "gpt-5", "-pro", "sonnet-4-7", "sonnet-4-6",
+    "ultra", "o1", "o3",
+)
+
+
+def _is_flagship_model(model: str) -> bool:
+    """Heuristic: True if the model name suggests a flagship-tier model."""
+    if not model:
+        return False
+    m = model.lower()
+    return any(tok in m for tok in _FLAGSHIP_MODEL_TOKENS)
 
 
 def _prompt_api_key(
@@ -550,7 +625,11 @@ def interactive_advanced_config(
     Returns a dict with keys matching init_command kwargs:
     ``commit_limit``, ``follow_renames``, ``skip_tests``, ``skip_infra``,
     ``concurrency``, ``exclude``, ``test_run``, ``embedder``,
-    ``include_submodules``, ``no_claude_md``.
+    ``include_submodules``.
+
+    Editor integration prompts are intentionally not asked here so that full and
+    advanced modes stay aligned. Editor setup owns those prompts after mode
+    selection.
     """
     console.print()
     console.print(
@@ -603,15 +682,18 @@ def interactive_advanced_config(
     console.print("  [dim]Gitignore-style patterns, comma-separated or one per line.[/dim]")
     console.print("  [dim]Press Enter with empty input to finish.[/dim]")
     patterns: list[str] = []
+    seen_patterns: set[str] = set()
     while True:
         raw = click.prompt("  Pattern", default="", show_default=False)
         raw = raw.strip()
         if not raw:
             break
-        # Support comma-separated input
+        # Support comma-separated input; dedupe so re-pasting / re-entering
+        # the same suggestions doesn't bloat the summary panel.
         for part in raw.split(","):
             part = part.strip()
-            if part:
+            if part and part not in seen_patterns:
+                seen_patterns.add(part)
                 patterns.append(part)
     result["exclude"] = tuple(patterns)
 
@@ -664,6 +746,12 @@ def interactive_advanced_config(
         type=int,
     )
 
+    result["reasoning"] = click.prompt(
+        "  Reasoning mode",
+        default="auto",
+        type=click.Choice(["auto", "off", "minimal"]),
+    )
+
     # Embedder selection
     detected_embedder = _resolve_embedder_from_env()
     embedder_choices = ["gemini", "openai", "mock"]
@@ -674,18 +762,8 @@ def interactive_advanced_config(
     )
 
     result["test_run"] = click.confirm(
-        "  Test run? (limit to top 10 files for quick validation)",
+        "  Test run? (full ingestion; LLM page generation limited to top 10 files for quick validation)",
         default=False,
-    )
-
-    # ── Editor Integration ────────────────────────────────────────────────
-    console.print()
-    console.print(f"  [{BRAND}]Editor Integration[/]")
-    console.print()
-
-    result["no_claude_md"] = not click.confirm(
-        "  Generate .claude/CLAUDE.md?",
-        default=True,
     )
 
     # ── Summary ───────────────────────────────────────────────────────────
@@ -700,11 +778,15 @@ def interactive_advanced_config(
     summary.add_row("Commit limit", str(result["commit_limit"]))
     summary.add_row("Follow renames", "yes" if result["follow_renames"] else "no")
     summary.add_row("Concurrency", str(result["concurrency"]))
+    summary.add_row("Reasoning", result["reasoning"])
     summary.add_row("Embedder", result["embedder"])
     if patterns:
-        summary.add_row("Exclude", ", ".join(patterns))
+        if len(patterns) <= 5:
+            summary.add_row("Exclude", ", ".join(patterns))
+        else:
+            # Bullet-list when many patterns — comma-joined wraps unreadably.
+            summary.add_row("Exclude", "\n".join(f"• {p}" for p in patterns))
     summary.add_row("Test run", "yes" if result["test_run"] else "no")
-    summary.add_row("CLAUDE.md", "no" if result["no_claude_md"] else "yes")
 
     console.print(
         Panel(
@@ -1063,12 +1145,22 @@ class MaybeCountColumn(ProgressColumn):
 _PHASE_LABELS: dict[str, str] = {
     "traverse": "Scanning & filtering files...",
     "parse": "Parsing files...",
+    "tsconfig": "Indexing tsconfig path aliases...",
     "graph": "Building dependency graph...",
+    "graph.imports": "  ↳ Resolving imports",
+    "graph.heritage": "  ↳ Resolving inheritance",
+    "graph.calls": "  ↳ Resolving call edges",
+    "dynamic_hints": "  ↳ Wiring dynamic hints",
+    "graph.metrics": "  ↳ Computing graph metrics (PageRank, betweenness)",
+    "graph.communities": "  ↳ Detecting communities",
+    "graph.flows": "  ↳ Tracing execution flows",
+    "external_systems": "Parsing external dependency manifests...",
     "git": "Indexing file history...",
     "co_change": "Analyzing co-changes...",
     "dead_code": "Detecting dead code...",
     "decisions": "Extracting decisions...",
     "generation": "Generating pages...",
+    "onboarding": "Curating onboarding docs...",
 }
 
 
@@ -1101,16 +1193,49 @@ class RichProgressCallback:
         if phase in self._tasks:
             self._progress.advance(self._tasks[phase])
 
+    def on_phase_done(self, phase: str) -> None:
+        """Mark a phase task as fully complete and hide it from the live
+        display, so the phase-summary lines that follow aren't interleaved
+        with stale progress bars (issue: phantom/duplicated progress bars).
+        """
+        task_id = self._tasks.get(phase)
+        if task_id is None:
+            return
+        try:
+            task = next(
+                (t for t in self._progress.tasks if t.id == task_id), None
+            )
+            if task is not None and task.total is not None:
+                self._progress.update(task_id, completed=task.total, visible=False)
+            else:
+                self._progress.update(task_id, visible=False)
+        except Exception:
+            pass
+
     def on_message(self, level: str, text: str) -> None:
         style_map = {"info": OK, "warning": WARN, "error": ERR}
         style = style_map.get(level, "")
         # Insight lines (indented with →) get special formatting
         if text.lstrip().startswith("→"):
-            self._progress.console.print(f"  [dim]{text}[/dim]")
+            line = f"  [dim]{text}[/dim]"
         elif style:
-            self._progress.console.print(f"  [{style}]{text}[/{style}]")
+            line = f"  [{style}]{text}[/{style}]"
         else:
-            self._progress.console.print(f"  {text}")
+            line = f"  {text}"
+
+        # Print under the Live lock so the line lands cleanly above the
+        # progress region instead of interleaving with still-rendering
+        # spinners (issue: phase summary lines interleaved with bars).
+        live = getattr(self._progress, "live", None)
+        if live is not None:
+            try:
+                with live._lock:
+                    self._progress.console.print(line)
+                self._progress.refresh()
+                return
+            except Exception:
+                pass
+        self._progress.console.print(line)
 
     def set_cost(self, total_cost: float) -> None:
         """Update the live cost display on all active progress tasks."""

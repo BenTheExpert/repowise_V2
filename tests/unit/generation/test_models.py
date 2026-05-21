@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 
+import pytest
+
 from repowise.core.generation.models import (
     ConfidenceDecayResult,
     GeneratedPage,
@@ -142,12 +144,31 @@ def test_decay_confidence_beyond_expiry_is_zero():
 
 def test_generation_config_defaults():
     config = GenerationConfig()
-    assert config.max_tokens == 16000
+    assert config.max_tokens == 20000
     assert config.temperature == 0.3
     assert config.token_budget == 48000
-    assert config.max_concurrency == 5
+    assert config.max_concurrency == 12
+    assert config.embed_concurrency == 12
     assert config.cache_enabled is True
     assert config.staleness_threshold_days == 7
     assert config.expiry_threshold_days == 30
-    assert config.top_symbol_percentile == 0.10
+    assert config.top_symbol_percentile == 0.20
+    assert config.module_grouping == "community"
+    assert config.min_module_size == 3
     assert config.large_file_source_pct == 0.4
+    assert config.reasoning == "auto"
+
+
+def test_generation_config_embed_concurrency_defaults_to_max_concurrency():
+    config = GenerationConfig(max_concurrency=3)
+    assert config.embed_concurrency == 3
+
+
+def test_generation_config_normalizes_reasoning():
+    config = GenerationConfig(reasoning="OFF")
+    assert config.reasoning == "off"
+
+
+def test_generation_config_rejects_invalid_reasoning():
+    with pytest.raises(ValueError):
+        GenerationConfig(reasoning="verbose")

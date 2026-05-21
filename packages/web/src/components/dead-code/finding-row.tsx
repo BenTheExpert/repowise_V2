@@ -1,15 +1,41 @@
 "use client";
 
 import { useState } from "react";
-import { Button } from "@/components/ui/button";
-import { Badge } from "@/components/ui/badge";
-import { truncatePath, formatConfidence } from "@/lib/utils/format";
+import { toast } from "sonner";
+import { GitBranch, Code2 } from "lucide-react";
+import { Button } from "@repowise-dev/ui/ui/button";
+import { Badge } from "@repowise-dev/ui/ui/badge";
+import { ConfirmDialog } from "@repowise-dev/ui/ui/confirm-dialog";
+import { RowActions } from "@repowise-dev/ui/shared/row-actions";
+import { formatConfidence } from "@repowise-dev/ui/lib/format";
 import { patchDeadCodeFinding } from "@/lib/api/dead-code";
 import { cn } from "@/lib/utils/cn";
 import type { DeadCodeFindingResponse } from "@/lib/api/types";
 
+const STATUS_LABELS: Record<string, { title: string; description: string; confirmLabel: string; destructive: boolean }> = {
+  resolved: {
+    title: "Resolve finding?",
+    description: "Mark this finding as resolved. You can undo from the toast.",
+    confirmLabel: "Resolve",
+    destructive: false,
+  },
+  acknowledged: {
+    title: "Acknowledge finding?",
+    description: "Mark this finding as acknowledged.",
+    confirmLabel: "Acknowledge",
+    destructive: false,
+  },
+  false_positive: {
+    title: "Mark as false positive?",
+    description: "This finding will be excluded from future analyses. You can undo from the toast.",
+    confirmLabel: "Mark FP",
+    destructive: true,
+  },
+};
+
 interface FindingRowProps {
   finding: DeadCodeFindingResponse;
+  repoId: string;
   selected: boolean;
   onToggle: (id: string) => void;
   onUpdate: (updated: DeadCodeFindingResponse) => void;
@@ -22,18 +48,46 @@ const STATUS_COLORS: Record<string, string> = {
   false_positive: "bg-[var(--color-bg-elevated)] text-[var(--color-text-tertiary)] border-[var(--color-border-default)]",
 };
 
-export function FindingRow({ finding, selected, onToggle, onUpdate }: FindingRowProps) {
+export function FindingRow({ finding, repoId, selected, onToggle, onUpdate }: FindingRowProps) {
   const [pending, setPending] = useState(false);
+  const [confirmStatus, setConfirmStatus] = useState<string | null>(null);
 
-  const patch = async (status: string) => {
+  const previousStatus = finding.status;
+
+  const applyPatch = async (status: string) => {
     setPending(true);
     try {
       const updated = await patchDeadCodeFinding(finding.id, { status });
       onUpdate(updated);
+      setConfirmStatus(null);
+      toast.success(`Finding ${status.replace(/_/g, " ")}`, {
+        action: {
+          label: "Undo",
+          onClick: async () => {
+            try {
+              const reverted = await patchDeadCodeFinding(finding.id, { status: previousStatus });
+              onUpdate(reverted);
+            } catch (err) {
+              toast.error(
+                err instanceof Error ? `Couldn't undo: ${err.message}` : "Couldn't undo",
+              );
+            }
+          },
+        },
+        duration: 6000,
+      });
+    } catch (err) {
+      toast.error(
+        err instanceof Error ? `Couldn't update finding: ${err.message}` : "Couldn't update finding",
+      );
     } finally {
       setPending(false);
     }
   };
+
+  const requestPatch = (status: string) => setConfirmStatus(status);
+
+  const confirmConfig = confirmStatus ? STATUS_LABELS[confirmStatus] : null;
 
   return (
     <tr
@@ -47,13 +101,14 @@ export function FindingRow({ finding, selected, onToggle, onUpdate }: FindingRow
           type="checkbox"
           checked={selected}
           onChange={() => onToggle(finding.id)}
+          aria-label={`Select finding ${finding.file_path}`}
           className="rounded border-[var(--color-border-default)]"
         />
       </td>
-      <td className="px-4 py-2.5 font-mono text-xs text-[var(--color-text-primary)]" style={{ maxWidth: 0 }}>
+      <td className="px-4 py-2.5 font-mono text-xs text-[var(--color-text-primary)] min-w-[200px] max-w-[480px]">
         <span className="truncate block" title={finding.file_path}>{finding.file_path}</span>
         {finding.symbol_name && (
-          <span className="text-[var(--color-text-tertiary)]">{finding.symbol_name}</span>
+          <span className="block truncate text-[var(--color-text-tertiary)]" title={finding.symbol_name}>{finding.symbol_name}</span>
         )}
       </td>
       <td className="px-4 py-2.5 text-xs text-[var(--color-text-secondary)] tabular-nums">
@@ -93,15 +148,23 @@ export function FindingRow({ finding, selected, onToggle, onUpdate }: FindingRow
           {finding.status.replace(/_/g, " ")}
         </span>
       </td>
-      <td className="px-4 py-2.5 hidden lg:table-cell">
+      <td className="px-4 py-2.5">
+        <div className="flex items-center gap-1 flex-wrap justify-end">
+          <RowActions
+            actions={[
+              { icon: GitBranch, label: "Graph", href: `/repos/${repoId}/graph?node=${encodeURIComponent(finding.file_path)}` },
+              ...(finding.symbol_name ? [{ icon: Code2, label: "Symbol", href: `/repos/${repoId}/symbols` }] : []),
+            ]}
+          />
         {finding.status === "open" && (
-          <div className="flex items-center gap-1">
+          <div className="flex items-center gap-1 flex-wrap justify-end">
             <Button
               size="sm"
               variant="ghost"
               disabled={pending}
-              onClick={() => patch("resolved")}
+              onClick={() => requestPatch("resolved")}
               className="h-6 px-2 text-xs text-green-500 hover:text-green-400"
+              aria-label={`Resolve ${finding.file_path}`}
             >
               Resolve
             </Button>
@@ -109,8 +172,9 @@ export function FindingRow({ finding, selected, onToggle, onUpdate }: FindingRow
               size="sm"
               variant="ghost"
               disabled={pending}
-              onClick={() => patch("acknowledged")}
+              onClick={() => requestPatch("acknowledged")}
               className="h-6 px-2 text-xs"
+              aria-label={`Acknowledge ${finding.file_path}`}
             >
               Ack
             </Button>
@@ -118,14 +182,28 @@ export function FindingRow({ finding, selected, onToggle, onUpdate }: FindingRow
               size="sm"
               variant="ghost"
               disabled={pending}
-              onClick={() => patch("false_positive")}
+              onClick={() => requestPatch("false_positive")}
               className="h-6 px-2 text-xs text-[var(--color-text-tertiary)]"
+              aria-label={`Mark ${finding.file_path} as false positive`}
             >
               FP
             </Button>
           </div>
         )}
+        </div>
       </td>
+      {confirmConfig && (
+        <ConfirmDialog
+          open={confirmStatus !== null}
+          onOpenChange={(o) => !o && setConfirmStatus(null)}
+          title={confirmConfig.title}
+          description={confirmConfig.description}
+          confirmLabel={confirmConfig.confirmLabel}
+          destructive={confirmConfig.destructive}
+          loading={pending}
+          onConfirm={() => applyPatch(confirmStatus!)}
+        />
+      )}
     </tr>
   );
 }

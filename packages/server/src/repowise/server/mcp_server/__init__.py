@@ -1,4 +1,4 @@
-"""repowise MCP Server — 7 tools for AI coding assistants.
+"""repowise MCP Server — 8 tools for AI coding assistants.
 
 Exposes the full repowise wiki as queryable tools via the MCP protocol.
 Supports both stdio transport (Claude Code, Cursor, Cline) and SSE transport
@@ -16,6 +16,9 @@ from typing import Any
 
 # --- Import submodules in dependency order (triggers tool registration) ---
 from repowise.server.mcp_server import _state
+from repowise.server.mcp_server._graph_utils import (  # used by routers/graph.py
+    build_visual_context as _build_visual_context,
+)
 from repowise.server.mcp_server._helpers import (
     _build_origin_story,
     _compute_alignment,
@@ -27,15 +30,14 @@ from repowise.server.mcp_server._server import (
     mcp,
     run_mcp,
 )
-from repowise.server.mcp_server._graph_utils import (  # used by routers/graph.py
-    build_visual_context as _build_visual_context,
-)
 from repowise.server.mcp_server.tool_answer import get_answer
 from repowise.server.mcp_server.tool_context import get_context
 from repowise.server.mcp_server.tool_dead_code import get_dead_code
+from repowise.server.mcp_server.tool_health import get_health
 from repowise.server.mcp_server.tool_overview import get_overview
 from repowise.server.mcp_server.tool_risk import get_risk
 from repowise.server.mcp_server.tool_search import search_codebase
+from repowise.server.mcp_server.tool_symbol import get_symbol
 from repowise.server.mcp_server.tool_why import get_why
 
 # ---------------------------------------------------------------------------
@@ -94,8 +96,10 @@ __all__ = [
     "get_answer",
     "get_context",
     "get_dead_code",
+    "get_health",
     "get_overview",
     "get_risk",
+    "get_symbol",
     "get_why",
     "mcp",
     "run_mcp",

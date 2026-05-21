@@ -1,32 +1,11 @@
-"""Auto-generated MCP config for Claude Code, Claude Desktop, Cursor, and Cline."""
+"""Generic MCP config helpers for repowise."""
 
 from __future__ import annotations
 
 import json
-import sys
 from pathlib import Path
 
-
-def _claude_desktop_config_path() -> Path | None:
-    """Return the Claude Desktop config path for this OS, or None if unsupported."""
-    if sys.platform == "darwin":
-        return (
-            Path.home()
-            / "Library"
-            / "Application Support"
-            / "Claude"
-            / "claude_desktop_config.json"
-        )
-    if sys.platform == "win32":
-        appdata = Path.home() / "AppData" / "Roaming"
-        return appdata / "Claude" / "claude_desktop_config.json"
-    # Linux / other: Claude Desktop not officially supported yet
-    return None
-
-
-def _claude_code_settings_path() -> Path:
-    """Return the global Claude Code settings path (~/.claude/settings.json)."""
-    return Path.home() / ".claude" / "settings.json"
+import click
 
 
 def generate_mcp_config(repo_path: Path) -> dict:
@@ -57,7 +36,7 @@ def save_mcp_config(repo_path: Path) -> Path:
 
 
 def save_root_mcp_config(repo_path: Path) -> Path:
-    """Write .mcp.json at repo root for Claude Code auto-discovery.
+    """Write .mcp.json at repo root for MCP clients that support discovery.
 
     Merges the repowise server entry into any existing mcpServers block
     so other MCP servers configured by the user are preserved.
@@ -66,10 +45,7 @@ def save_root_mcp_config(repo_path: Path) -> Path:
     new_entry = generate_mcp_config(repo_path)["mcpServers"]
 
     if config_path.exists():
-        try:
-            existing = json.loads(config_path.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, OSError):
-            existing = {}
+        existing = load_existing_config(config_path)
         servers = dict(existing.get("mcpServers", {}))
         servers.update(new_entry)
         existing["mcpServers"] = servers
@@ -81,17 +57,14 @@ def save_root_mcp_config(repo_path: Path) -> Path:
     return config_path
 
 
-def _merge_mcp_entry(config_path: Path, new_entry: dict) -> bool:
+def merge_mcp_entry(config_path: Path, new_entry: dict) -> bool:
     """Merge *new_entry* into the mcpServers block of *config_path*.
 
     Creates the file if it doesn't exist. Returns True on success.
     """
     try:
         if config_path.exists():
-            try:
-                existing = json.loads(config_path.read_text(encoding="utf-8"))
-            except (json.JSONDecodeError, OSError):
-                existing = {}
+            existing = load_existing_config(config_path)
         else:
             config_path.parent.mkdir(parents=True, exist_ok=True)
             existing = {}
@@ -105,108 +78,26 @@ def _merge_mcp_entry(config_path: Path, new_entry: dict) -> bool:
         return False
 
 
-def register_with_claude_desktop(repo_path: Path) -> Path | None:
-    """Add repowise MCP server to Claude Desktop's config.
-
-    Returns the config path if successful, None if Claude Desktop is not
-    present or the platform is unsupported.
-    """
-    config_path = _claude_desktop_config_path()
-    if config_path is None:
-        return None
-    if not config_path.parent.exists():
-        # Claude Desktop not installed
-        return None
-    entry = generate_mcp_config(repo_path)["mcpServers"]
-    return config_path if _merge_mcp_entry(config_path, entry) else None
-
-
-def register_with_claude_code(repo_path: Path) -> Path | None:
-    """Add repowise MCP server to global Claude Code settings (~/.claude/settings.json).
-
-    Returns the settings path if successful, None on failure.
-    """
-    settings_path = _claude_code_settings_path()
-    entry = generate_mcp_config(repo_path)["mcpServers"]
-    return settings_path if _merge_mcp_entry(settings_path, entry) else None
-
-
-def install_claude_code_hooks() -> Path | None:
-    """Register PreToolUse and PostToolUse hooks in ~/.claude/settings.json.
-
-    PreToolUse: enriches Grep/Glob searches with graph context (importers,
-    symbols) from the local wiki.db.
-
-    PostToolUse: detects git commits and notifies the agent when the wiki
-    is stale.
-
-    Merges into existing hooks without clobbering user-defined entries.
-    Returns the settings path on success, None on failure.
-    """
-    settings_path = _claude_code_settings_path()
-
-    pre_hook_entry = {
-        "matcher": "Grep|Glob",
-        "hooks": [
-            {
-                "type": "command",
-                "command": "repowise augment",
-                "timeout": 10,
-                "statusMessage": "Enriching with codebase context...",
-            }
-        ],
-    }
-
-    post_hook_entry = {
-        "matcher": "Bash",
-        "hooks": [
-            {
-                "type": "command",
-                "command": "repowise augment",
-                "timeout": 10,
-                "statusMessage": "Checking wiki freshness...",
-            }
-        ],
-    }
-
+def load_existing_config(config_path: Path) -> dict:
+    """Load an existing JSON config without silently replacing bad content."""
     try:
-        if settings_path.exists():
-            try:
-                existing = json.loads(settings_path.read_text(encoding="utf-8"))
-            except (json.JSONDecodeError, OSError):
-                existing = {}
-        else:
-            settings_path.parent.mkdir(parents=True, exist_ok=True)
-            existing = {}
-
-        hooks = existing.setdefault("hooks", {})
-
-        # Merge PreToolUse — avoid duplicates
-        pre_hooks = hooks.setdefault("PreToolUse", [])
-        if not _has_repowise_hook(pre_hooks):
-            pre_hooks.append(pre_hook_entry)
-
-        # Merge PostToolUse — avoid duplicates
-        post_hooks = hooks.setdefault("PostToolUse", [])
-        if not _has_repowise_hook(post_hooks):
-            post_hooks.append(post_hook_entry)
-
-        settings_path.write_text(
-            json.dumps(existing, indent=2) + "\n", encoding="utf-8"
+        existing = json.loads(config_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise click.ClickException(
+            f"Cannot update {config_path}: existing file is not valid JSON. "
+            "Fix or remove it and retry; no changes were written."
+        ) from exc
+    except OSError as exc:
+        raise click.ClickException(
+            f"Cannot update {config_path}: existing file could not be read. "
+            "Fix the file permissions and retry; no changes were written."
+        ) from exc
+    if not isinstance(existing, dict):
+        raise click.ClickException(
+            f"Cannot update {config_path}: existing file must contain a JSON object. "
+            "Fix or remove it and retry; no changes were written."
         )
-        return settings_path
-    except OSError:
-        return None
-
-
-def _has_repowise_hook(hook_list: list) -> bool:
-    """Check if a repowise augment hook is already registered."""
-    for entry in hook_list:
-        for hook in entry.get("hooks", []):
-            cmd = hook.get("command", "")
-            if "repowise augment" in cmd:
-                return True
-    return False
+    return existing
 
 
 def format_setup_instructions(repo_path: Path) -> str:
@@ -219,7 +110,7 @@ def format_setup_instructions(repo_path: Path) -> str:
 MCP Server Configuration
 ========================
 
-Claude Code: automatically configured via .mcp.json (no manual steps needed).
+Project .mcp.json: automatically written for MCP clients that support repo-local discovery.
 
 Cursor (.cursor/mcp.json):
   {server_block}

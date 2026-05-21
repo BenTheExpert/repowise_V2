@@ -4,16 +4,17 @@ import { useState } from "react";
 import useSWR from "swr";
 import { useParams } from "next/navigation";
 import { Users, Shield } from "lucide-react";
-import { StatCard } from "@/components/shared/stat-card";
-import { OwnershipTable } from "@/components/git/ownership-table";
-import { ContributorBar } from "@/components/git/contributor-bar";
-import { OwnershipTreemap } from "@/components/git/ownership-treemap";
-import { BusFactorPanel } from "@/components/git/bus-factor-panel";
-import { ContributorNetwork } from "@/components/git/contributor-network";
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
-import { Skeleton } from "@/components/ui/skeleton";
+import { RoutedToRiskBanner } from "@/components/risk/routed-to-risk-banner";
+import { StatCard } from "@repowise-dev/ui/shared/stat-card";
+import { OwnershipTable } from "@repowise-dev/ui/git/ownership-table";
+import { ContributorBar } from "@repowise-dev/ui/git/contributor-bar";
+import { OwnershipTreemap } from "@repowise-dev/ui/git/ownership-treemap";
+import { BusFactorPanel } from "@repowise-dev/ui/git/bus-factor-panel";
+import { Card, CardContent, CardHeader, CardTitle } from "@repowise-dev/ui/ui/card";
+import { Skeleton } from "@repowise-dev/ui/ui/skeleton";
 import { getOwnership, getGitSummary, getHotspots } from "@/lib/api/git";
-import { formatNumber } from "@/lib/utils/format";
+import { HealthRisksPanel } from "@/components/health/health-risks-panel";
+import { formatNumber } from "@repowise-dev/ui/lib/format";
 import { cn } from "@/lib/utils/cn";
 import type { OwnershipEntry, GitSummaryResponse, HotspotResponse } from "@/lib/api/types";
 
@@ -47,6 +48,7 @@ export default function OwnershipPage() {
 
   return (
     <div className="p-4 sm:p-6 space-y-6 max-w-[1600px]">
+      <RoutedToRiskBanner repoId={id} tab="heatmap" tabLabel="Heatmap (ownership)" />
       <div>
         <h1 className="text-xl font-semibold text-[var(--color-text-primary)] mb-1 flex items-center gap-2">
           <Users className="h-5 w-5 text-[var(--color-accent-primary)]" />
@@ -151,31 +153,21 @@ export default function OwnershipPage() {
         )}
       </div>
 
-      {/* Contributor Network */}
-      {hotspotData && hotspotData.length > 0 && (
-        <Card>
-          <CardHeader className="pb-2">
-            <CardTitle className="text-sm">Contributor Network</CardTitle>
-            <p className="text-xs text-[var(--color-text-tertiary)]">
-              Contributors linked by shared file ownership — larger nodes own more files
-            </p>
-          </CardHeader>
-          <CardContent className="pt-0">
-            <ContributorNetwork hotspots={hotspotData} />
-          </CardContent>
-        </Card>
-      )}
-
-      {/* Detail table */}
-      {loadingEntries ? (
-        <div className="space-y-2">
-          {Array.from({ length: 8 }).map((_, i) => (
-            <Skeleton key={i} className="h-10 w-full" />
-          ))}
+      {/* Detail table + health sidecar */}
+      <div className="grid grid-cols-1 gap-6 xl:grid-cols-4">
+        <div className="xl:col-span-3">
+          {loadingEntries ? (
+            <div className="space-y-2">
+              {Array.from({ length: 8 }).map((_, i) => (
+                <Skeleton key={i} className="h-10 w-full" />
+              ))}
+            </div>
+          ) : (
+            <OwnershipTable entries={entries ?? []} repoId={id} />
+          )}
         </div>
-      ) : (
-        <OwnershipTable entries={entries ?? []} />
-      )}
+        <HealthRisksPanel repoId={id} title="Lowest-health files" limit={6} />
+      </div>
     </div>
   );
 }

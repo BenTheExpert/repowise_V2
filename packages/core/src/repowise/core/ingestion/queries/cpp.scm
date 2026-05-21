@@ -17,11 +17,36 @@
   )
 ) @symbol.def
 
+; Inline method definition inside a class body: void method(args) { ... }
+; The name is a ``field_identifier`` in this case, not a plain identifier.
+(function_definition
+  declarator: (function_declarator
+    declarator: (field_identifier) @symbol.name
+    parameters: (parameter_list) @symbol.params
+  )
+) @symbol.def
+
 ; Qualified function definition: ReturnType ClassName::method(params) { }
 (function_definition
   declarator: (function_declarator
     declarator: (qualified_identifier
       name: (identifier) @symbol.name
+    )
+    parameters: (parameter_list) @symbol.params
+  )
+) @symbol.def
+
+; Two-level qualified function: ReturnType NS::ClassName::method(params) { }
+; The grammar nests the qualified_identifier left-recursively, so we
+; need a separate pattern for each depth. Parser walks the captured
+; name's qualified-identifier parent to extract the class name, so the
+; deeper namespace prefix doesn't need to be captured here.
+(function_definition
+  declarator: (function_declarator
+    declarator: (qualified_identifier
+      name: (qualified_identifier
+        name: (identifier) @symbol.name
+      )
     )
     parameters: (parameter_list) @symbol.params
   )

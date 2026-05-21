@@ -140,6 +140,108 @@ class TestPythonParser:
         op_import = next(i for i in result.imports if i.module_path == "python_pkg.models")
         assert "Operation" in op_import.imported_names
 
+    def test_relative_from_import_single_name(self, parser: ASTParser) -> None:
+        # Regression: `from .X import Y` was dropping the only imported name.
+        fi = _make_file_info("pkg/__init__.py", "python")
+        result = parser.parse_file(fi, b"from .graph import GraphBuilder\n")
+        rel_import = next(i for i in result.imports if "graph" in i.module_path)
+        assert rel_import.imported_names == ["GraphBuilder"]
+
+    def test_relative_from_import_multiple_names_keeps_first(
+        self, parser: ASTParser
+    ) -> None:
+        # Regression: `from .X import A, B, C` was dropping `A`.
+        fi = _make_file_info("pkg/__init__.py", "python")
+        result = parser.parse_file(
+            fi, b"from .change_detector import AffectedPages, ChangeDetector, FileDiff\n"
+        )
+        rel_import = next(i for i in result.imports if "change_detector" in i.module_path)
+        assert rel_import.imported_names == ["AffectedPages", "ChangeDetector", "FileDiff"]
+
+    def test_bare_relative_import_expands_to_one_per_submodule(
+        self, parser: ASTParser
+    ) -> None:
+        # Regression (D2): ``from . import a, b`` produced one Import with
+        # ``module_path="."`` which the resolver dropped on the floor, so
+        # every plugin-registry barrel silently lost its sibling-submodule
+        # edges. Expansion rewrites each name into ``.a``/``.b`` so the
+        # existing relative-resolver can locate the submodule.
+        fi = _make_file_info("pkg/__init__.py", "python")
+        result = parser.parse_file(
+            fi, b"from . import cargo, go, npm, nuget, pypi\n"
+        )
+        paths = sorted(i.module_path for i in result.imports if i.is_relative)
+        assert paths == [".cargo", ".go", ".npm", ".nuget", ".pypi"]
+        for imp in result.imports:
+            if imp.module_path.startswith(".") and imp.module_path != ".":
+                assert len(imp.imported_names) == 1
+                assert imp.imported_names[0] == imp.module_path.lstrip(".")
+
+    def test_bare_double_dot_relative_import_expands(self, parser: ASTParser) -> None:
+        # ``from .. import x`` must also expand, preserving dot depth.
+        fi = _make_file_info("pkg/sub/mod.py", "python")
+        result = parser.parse_file(fi, b"from .. import sibling, other\n")
+        paths = sorted(i.module_path for i in result.imports if i.is_relative)
+        assert paths == ["..other", "..sibling"]
+
+    def test_named_relative_import_is_not_split(self, parser: ASTParser) -> None:
+        # Negative: ``from .pkg import a, b`` must stay as a single Import —
+        # only the bare-dots case is rewritten.
+        fi = _make_file_info("pkg/use.py", "python")
+        result = parser.parse_file(fi, b"from .pkg import a, b\n")
+        rel = [i for i in result.imports if i.module_path == ".pkg"]
+        assert len(rel) == 1
+        assert sorted(rel[0].imported_names) == ["a", "b"]
+
+    def test_absolute_from_import_skips_module_keeps_first_name(
+        self, parser: ASTParser
+    ) -> None:
+        # Guard against over-correction: absolute imports must still drop the
+        # module path while keeping every imported name including the first.
+        fi = _make_file_info("pkg/use.py", "python")
+        result = parser.parse_file(
+            fi, b"from python_pkg.models import Operation, Result\n"
+        )
+        imp = next(i for i in result.imports if i.module_path == "python_pkg.models")
+        assert imp.imported_names == ["Operation", "Result"]
+
+    def test_nested_function_not_extracted_as_top_level(self, parser: ASTParser) -> None:
+        # Regression (D8): orchestrator-style helpers defined inside an
+        # async method (e.g. ``_on_start``, ``_on_done``, ``_step``) were
+        # flattened to the top-level symbol list and read as unused public
+        # exports. Only module-top-level + class-body members should appear.
+        src = (
+            b"async def run():\n"
+            b"    def _on_start():\n"
+            b"        pass\n"
+            b"    async def _step():\n"
+            b"        pass\n"
+            b"\n"
+            b"class Worker:\n"
+            b"    async def perform(self):\n"
+            b"        def _on_done():\n"
+            b"            pass\n"
+            b"        return _on_done\n"
+        )
+        fi = _make_file_info("pkg/orchestrator.py", "python")
+        result = parser.parse_file(fi, src)
+        names = {s.name for s in result.symbols}
+        assert names == {"run", "Worker", "perform"}
+        assert "_on_start" not in names
+        assert "_step" not in names
+        assert "_on_done" not in names
+
+    def test_nested_class_inside_function_not_extracted(self, parser: ASTParser) -> None:
+        src = (
+            b"def make():\n"
+            b"    class Helper:\n"
+            b"        def m(self): pass\n"
+        )
+        fi = _make_file_info("pkg/factories.py", "python")
+        result = parser.parse_file(fi, src)
+        names = {s.name for s in result.symbols}
+        assert names == {"make"}
+
     def test_function_docstring(self, parser: ASTParser) -> None:
         fi = _make_file_info("pkg/calc.py", "python")
         result = parser.parse_file(fi, PYTHON_SOURCE)
@@ -275,6 +377,116 @@ class TestTypeScriptParser:
         fi = _make_file_info("typescript_pkg/src/client.ts", "typescript")
         result = parser.parse_file(fi, TS_SOURCE)
         assert result.parse_errors == []
+
+    def test_nested_helpers_inside_component_not_extracted(
+        self, parser: ASTParser
+    ) -> None:
+        # Regression (D5): React component bodies contain helper function
+        # declarations and arrow-const handlers (``handleSave``,
+        # ``handleKeyDown``, ``Section``) that were being flattened to
+        # top-level public symbols and surfacing as ``unused_export``
+        # findings with confidence 1.0.
+        src = b"""
+export function GeneralForm({ onSave }: Props) {
+  function addPattern(p: string) { return p; }
+  async function handleSave() { onSave(); }
+  const Section = ({ title }: { title: string }) => <div>{title}</div>;
+  const handleKeyDown = (e: KeyboardEvent) => { e.preventDefault(); };
+  return <Section title="x" />;
+}
+
+export const Wrapper = () => {
+  const inner = () => 42;
+  return inner();
+};
+"""
+        fi = _make_file_info("ui/src/general-form.tsx", "typescript")
+        result = parser.parse_file(fi, src)
+        names = {s.name for s in result.symbols}
+        assert "GeneralForm" in names
+        assert "Wrapper" in names
+        for hidden in ("addPattern", "handleSave", "Section", "handleKeyDown", "inner"):
+            assert hidden not in names, f"nested helper {hidden} leaked to top level"
+
+    def test_tsx_file_uses_jsx_grammar(self, parser: ASTParser) -> None:
+        # .tsx files require the JSX-aware grammar variant; the default
+        # typescript grammar errors out on ``<Component />`` and recovers
+        # by hoisting nested helpers out of the broken component body.
+        src = b"""
+export function Card({ title }: { title: string }) {
+  function handleClick() { console.log("clicked"); }
+  return <div onClick={handleClick}>{title}</div>;
+}
+"""
+        fi = _make_file_info("ui/src/card.tsx", "typescript")
+        result = parser.parse_file(fi, src)
+        assert result.parse_errors == []
+        names = {s.name for s in result.symbols}
+        assert "Card" in names
+        assert "handleClick" not in names
+
+    def test_jsx_element_registers_as_call_target(self, parser: ASTParser) -> None:
+        # Regression: ``<StatRow ... />`` inside the same file as the
+        # ``StatRow`` component definition was not registering as a call,
+        # so same-file-only sub-components surfaced as unused public
+        # exports at confidence 1.0. The tsx-specific JSX captures now
+        # emit a CallSite for both self-closing and paired elements.
+        src = b"""
+export function StatRow({ value }: { value: number }) {
+  return <span>{value}</span>;
+}
+
+export function Section({ title }: { title: string }) {
+  return <h2>{title}</h2>;
+}
+
+export function Card() {
+  return (
+    <div>
+      <Section title="x" />
+      <StatRow value={1}></StatRow>
+    </div>
+  );
+}
+"""
+        fi = _make_file_info("ui/src/card.tsx", "typescript")
+        result = parser.parse_file(fi, src)
+        targets = {c.target_name for c in result.calls}
+        assert "StatRow" in targets
+        assert "Section" in targets
+
+    def test_jsx_element_call_works_for_jsx_grammar(
+        self, parser: ASTParser
+    ) -> None:
+        # Same behaviour for .jsx (plain JavaScript grammar already
+        # supports JSX node types natively).
+        src = b"""
+export function StatRow({ value }) {
+  return <span>{value}</span>;
+}
+
+export function Card() {
+  return <StatRow value={1} />;
+}
+"""
+        fi = _make_file_info("ui/src/card.jsx", "javascript")
+        result = parser.parse_file(fi, src)
+        targets = {c.target_name for c in result.calls}
+        assert "StatRow" in targets
+
+    def test_class_methods_still_extracted(self, parser: ASTParser) -> None:
+        # Negative for D5: methods inside class bodies must still be
+        # extracted — only function/method *bodies* count as nesting.
+        src = b"""
+export class Service {
+  run() { return 1; }
+  private helper() { return 2; }
+}
+"""
+        fi = _make_file_info("ui/src/service.ts", "typescript")
+        result = parser.parse_file(fi, src)
+        method_names = {s.name for s in result.symbols if s.kind == "method"}
+        assert {"run", "helper"} <= method_names
 
 
 # ---------------------------------------------------------------------------
@@ -552,9 +764,11 @@ class TestCppParser:
     def test_finds_functions_in_source(self, parser: ASTParser) -> None:
         fi = _make_file_info("cpp_pkg/calculator.cpp", "cpp")
         result = parser.parse_file(fi, CPP_SOURCE)
-        fns = [s for s in result.symbols if s.kind == "function"]
-        # Qualified definitions like Calculator::add should be caught
-        assert len(fns) >= 1
+        # ``Calculator::add`` style qualified definitions now resolve to
+        # ``kind=method`` with ``parent_name=Calculator``; free functions
+        # stay ``kind=function``. Either way we expect symbols to land.
+        callable_symbols = [s for s in result.symbols if s.kind in ("function", "method")]
+        assert len(callable_symbols) >= 1
 
     def test_parses_includes(self, parser: ASTParser) -> None:
         fi = _make_file_info("cpp_pkg/calculator.cpp", "cpp")
@@ -799,6 +1013,132 @@ class TestCSharpParser:
 
 
 # ---------------------------------------------------------------------------
+# C# — modern features (records, delegates, events, namespaces, global using)
+# ---------------------------------------------------------------------------
+
+CSHARP_MODERN_SOURCE = b"""\
+global using System;
+global using static System.Math;
+using Foo = Sample.Very.Long.Namespace.Type;
+using static System.Convert;
+
+namespace Sample.Modern;
+
+public delegate int BinaryOp(int x, int y);
+
+public record User(string Name, int Age);
+
+public record struct Coordinate(double X, double Y);
+
+public class EventBus
+{
+    public event EventHandler<string>? MessageReceived;
+    public string Topic = "default";
+    private const int MaxListeners = 100;
+}
+
+public enum Status { Active, Inactive, Pending }
+"""
+
+
+class TestCSharpModernParser:
+    def test_finds_record(self, parser: ASTParser) -> None:
+        fi = _make_file_info("csharp_pkg/Modern.cs", "csharp")
+        result = parser.parse_file(fi, CSHARP_MODERN_SOURCE)
+        names = {s.name for s in result.symbols}
+        assert "User" in names
+
+    def test_finds_record_struct(self, parser: ASTParser) -> None:
+        fi = _make_file_info("csharp_pkg/Modern.cs", "csharp")
+        result = parser.parse_file(fi, CSHARP_MODERN_SOURCE)
+        names = {s.name for s in result.symbols}
+        assert "Coordinate" in names
+
+    def test_finds_delegate(self, parser: ASTParser) -> None:
+        fi = _make_file_info("csharp_pkg/Modern.cs", "csharp")
+        result = parser.parse_file(fi, CSHARP_MODERN_SOURCE)
+        names = {s.name for s in result.symbols}
+        assert "BinaryOp" in names
+
+    def test_finds_event(self, parser: ASTParser) -> None:
+        fi = _make_file_info("csharp_pkg/Modern.cs", "csharp")
+        result = parser.parse_file(fi, CSHARP_MODERN_SOURCE)
+        names = {s.name for s in result.symbols}
+        assert "MessageReceived" in names
+
+    def test_finds_field(self, parser: ASTParser) -> None:
+        fi = _make_file_info("csharp_pkg/Modern.cs", "csharp")
+        result = parser.parse_file(fi, CSHARP_MODERN_SOURCE)
+        names = {s.name for s in result.symbols}
+        assert "Topic" in names
+        assert "MaxListeners" in names
+
+    def test_finds_enum_member(self, parser: ASTParser) -> None:
+        fi = _make_file_info("csharp_pkg/Modern.cs", "csharp")
+        result = parser.parse_file(fi, CSHARP_MODERN_SOURCE)
+        names = {s.name for s in result.symbols}
+        assert "Active" in names
+        assert "Inactive" in names
+
+    def test_finds_file_scoped_namespace(self, parser: ASTParser) -> None:
+        fi = _make_file_info("csharp_pkg/Modern.cs", "csharp")
+        result = parser.parse_file(fi, CSHARP_MODERN_SOURCE)
+        modules = [s for s in result.symbols if s.kind == "module"]
+        assert any("Sample.Modern" in s.name or s.name == "Sample.Modern" for s in modules)
+
+    def test_imports_capture_global_and_static(self, parser: ASTParser) -> None:
+        fi = _make_file_info("csharp_pkg/Modern.cs", "csharp")
+        result = parser.parse_file(fi, CSHARP_MODERN_SOURCE)
+        modules = {imp.module_path for imp in result.imports}
+        # global using and using static still surface as imports — full flag
+        # propagation (is_global / is_static) lives in the binding extractor.
+        assert "System" in modules
+        assert any("Math" in m for m in modules)
+        assert any("Convert" in m for m in modules)
+        # The alias form `using Foo = Long.Namespace.Type` is captured as the
+        # right-hand qualified name; alias propagation is wired in Batch 3.
+        assert len(result.imports) >= 3
+
+    def test_no_parse_errors(self, parser: ASTParser) -> None:
+        fi = _make_file_info("csharp_pkg/Modern.cs", "csharp")
+        result = parser.parse_file(fi, CSHARP_MODERN_SOURCE)
+        assert result.parse_errors == []
+
+
+class TestCSharpRegistryMetadata:
+    def test_csharp_spec_has_manifest_files(self) -> None:
+        from repowise.core.ingestion.languages.registry import REGISTRY
+
+        spec = REGISTRY.get("csharp")
+        assert spec is not None
+        assert "global.json" in spec.manifest_files
+        assert "Directory.Build.props" in spec.manifest_files
+
+    def test_csharp_spec_has_blocked_dirs(self) -> None:
+        from repowise.core.ingestion.languages.registry import REGISTRY
+
+        spec = REGISTRY.get("csharp")
+        assert spec is not None
+        assert "bin" in spec.blocked_dirs
+        assert "obj" in spec.blocked_dirs
+
+    def test_csharp_spec_has_generated_suffixes(self) -> None:
+        from repowise.core.ingestion.languages.registry import REGISTRY
+
+        spec = REGISTRY.get("csharp")
+        assert spec is not None
+        assert ".g.cs" in spec.generated_suffixes
+        assert ".Designer.cs" in spec.generated_suffixes
+
+    def test_csharp_record_in_heritage_node_types(self) -> None:
+        from repowise.core.ingestion.languages.registry import REGISTRY
+
+        spec = REGISTRY.get("csharp")
+        assert spec is not None
+        assert "record_declaration" in spec.heritage_node_types
+
+
+# ---------------------------------------------------------------------------
 # Swift
 # ---------------------------------------------------------------------------
 
@@ -1011,12 +1351,56 @@ class TestPhpParser:
         assert result.parse_errors == []
 
 
+# ---------------------------------------------------------------------------
+# Luau (issue #52 — Roblox/Rojo support)
+# ---------------------------------------------------------------------------
+
+LUAU_SOURCE = b"""-- Module docstring placeholder.
+
+local Signal = require(script.Parent.Signal)
+local Shared = require(game.ReplicatedStorage.Shared.Util)
+
+type Callback = (value: number) -> ()
+
+function greet(name: string): string
+    return "hello " .. name
+end
+
+function Calculator:add(x: number, y: number): number
+    return x + y
+end
+"""
+
+
+# tree-sitter-luau is a real dep in pyproject.toml, but it is sometimes
+# absent from a partially-synced developer venv (e.g. when an old `uv pip
+# install -e .` ran before the dep was added). Skip explicitly so the
+# failure mode is "go run uv sync" rather than two confusing AssertionErrors.
+pytest.importorskip("tree_sitter_luau", reason="run `uv sync --all-packages`")
+
+
+class TestLuauParser:
+    def test_finds_top_level_function(self, parser: ASTParser) -> None:
+        fi = _make_file_info("luau_pkg/init.luau", "luau")
+        result = parser.parse_file(fi, LUAU_SOURCE)
+        names = [s.name for s in result.symbols]
+        assert "greet" in names
+
+    def test_parses_require_imports(self, parser: ASTParser) -> None:
+        fi = _make_file_info("luau_pkg/init.luau", "luau")
+        result = parser.parse_file(fi, LUAU_SOURCE)
+        raw = [i.module_path for i in result.imports]
+        # The .scm emits the raw argument text; the resolver interprets it.
+        assert any("Signal" in m for m in raw)
+        assert any("ReplicatedStorage" in m for m in raw)
+
+
 class TestLanguageConfigs:
     def test_all_supported_languages_have_config(self) -> None:
         expected = {
             "python", "typescript", "javascript", "go", "rust",
             "java", "cpp", "c", "kotlin", "ruby", "csharp", "swift",
-            "scala", "php",
+            "scala", "php", "luau",
         }
         for lang in expected:
             assert lang in LANGUAGE_CONFIGS, f"Missing config for {lang}"

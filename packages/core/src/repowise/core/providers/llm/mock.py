@@ -32,6 +32,7 @@ import json
 from pathlib import Path
 
 from repowise.core.providers.llm.base import BaseProvider, GeneratedResponse
+from repowise.core.reasoning import ReasoningMode
 
 # Resolve fixture directory relative to this file so tests work regardless
 # of working directory. Goes up: mock.py → providers/ → core/ → repowise/ →
@@ -108,6 +109,8 @@ class MockProvider(BaseProvider):
         max_tokens: int = 4096,
         temperature: float = 0.3,
         request_id: str | None = None,
+        reasoning: ReasoningMode = "auto",
+        cache_hints: tuple = (),
     ) -> GeneratedResponse:
         """Return a fixture response without calling any external API."""
         self._calls.append(
@@ -117,6 +120,7 @@ class MockProvider(BaseProvider):
                 "max_tokens": max_tokens,
                 "temperature": temperature,
                 "request_id": request_id,
+                "reasoning": reasoning,
             }
         )
         call_idx = self._call_count

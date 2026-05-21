@@ -3,8 +3,15 @@
 import * as React from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
-import { Badge } from "@/components/ui/badge";
+import useSWR from "swr";
+import { toast } from "sonner";
+import Link from "next/link";
+import { ChevronLeft } from "lucide-react";
+import { Badge } from "@repowise-dev/ui/ui/badge";
+import { ConfirmDialog } from "@repowise-dev/ui/ui/confirm-dialog";
+import { ModuleLinkEditor } from "@repowise-dev/ui/decisions/module-link-editor";
 import { patchDecision } from "@/lib/api/decisions";
+import { listModuleHealth } from "@/lib/api/modules";
 import type { DecisionRecordResponse } from "@/lib/api/types";
 
 const STATUS_VARIANT: Record<string, "default" | "fresh" | "stale" | "outdated" | "outline" | "accent"> = {
@@ -19,22 +26,136 @@ interface DecisionDetailProps {
   repoId: string;
 }
 
+const CONFIRM_COPY: Record<string, { title: string; description: string; confirmLabel: string; destructive: boolean }> = {
+  active: {
+    title: "Confirm decision?",
+    description: "Mark this decision as active.",
+    confirmLabel: "Confirm",
+    destructive: false,
+  },
+  deprecated: {
+    title: "Deprecate decision?",
+    description: "This will mark the decision as deprecated. Existing references remain but it will no longer be considered current.",
+    confirmLabel: "Deprecate",
+    destructive: true,
+  },
+};
+
 export function DecisionDetail({ decision, repoId }: DecisionDetailProps) {
   const [status, setStatus] = React.useState(decision.status);
   const [loading, setLoading] = React.useState(false);
+  const [pendingStatus, setPendingStatus] = React.useState<string | null>(null);
+  const [linkedModules, setLinkedModules] = React.useState(decision.affected_modules);
+  const [linkedFiles, setLinkedFiles] = React.useState(decision.affected_files);
+  const [linkageSaving, setLinkageSaving] = React.useState(false);
 
-  const handleStatusChange = async (newStatus: string) => {
+  // Suggestions for the module autocomplete — top-level modules indexed for
+  // this repo. Loaded once; cheap to cache.
+  const { data: moduleHealth } = useSWR(
+    `module-health-suggestions:${repoId}`,
+    () => listModuleHealth(repoId, { sort: "file_count", limit: 500 }),
+    { revalidateOnFocus: false },
+  );
+  const moduleSuggestions = React.useMemo(
+    () => (moduleHealth?.items ?? []).map((m) => m.module_path),
+    [moduleHealth],
+  );
+
+  const saveLinkage = async (next: { modules: string[]; files: string[] }) => {
+    const previousModules = linkedModules;
+    const previousFiles = linkedFiles;
+    setLinkageSaving(true);
+    try {
+      await patchDecision(repoId, decision.id, {
+        affected_modules: next.modules,
+        affected_files: next.files,
+      });
+      setLinkedModules(next.modules);
+      setLinkedFiles(next.files);
+      toast.success("Decision linkage updated", {
+        action: {
+          label: "Undo",
+          onClick: async () => {
+            try {
+              await patchDecision(repoId, decision.id, {
+                affected_modules: previousModules,
+                affected_files: previousFiles,
+              });
+              setLinkedModules(previousModules);
+              setLinkedFiles(previousFiles);
+            } catch (err) {
+              toast.error(
+                err instanceof Error ? `Couldn't undo: ${err.message}` : "Couldn't undo",
+              );
+            }
+          },
+        },
+        duration: 6000,
+      });
+    } catch (err) {
+      toast.error(
+        err instanceof Error
+          ? `Couldn't save linkage: ${err.message}`
+          : "Couldn't save linkage",
+      );
+    } finally {
+      setLinkageSaving(false);
+    }
+  };
+
+  const applyStatusChange = async (newStatus: string) => {
+    const previous = status;
     setLoading(true);
     try {
       await patchDecision(repoId, decision.id, { status: newStatus });
       setStatus(newStatus as typeof status);
+      setPendingStatus(null);
+      toast.success(`Decision marked ${newStatus.replace(/_/g, " ")}`, {
+        action: {
+          label: "Undo",
+          onClick: async () => {
+            try {
+              await patchDecision(repoId, decision.id, { status: previous });
+              setStatus(previous);
+            } catch (err) {
+              toast.error(
+                err instanceof Error ? `Couldn't undo: ${err.message}` : "Couldn't undo",
+              );
+            }
+          },
+        },
+        duration: 6000,
+      });
+    } catch (err) {
+      toast.error(
+        err instanceof Error
+          ? `Couldn't update decision: ${err.message}`
+          : "Couldn't update decision",
+      );
     } finally {
       setLoading(false);
     }
   };
 
+  const handleStatusChange = (newStatus: string) => {
+    if (CONFIRM_COPY[newStatus]) {
+      setPendingStatus(newStatus);
+    } else {
+      void applyStatusChange(newStatus);
+    }
+  };
+
+  const confirmConfig = pendingStatus ? CONFIRM_COPY[pendingStatus] : null;
+
   return (
     <div className="space-y-6">
+      <Link
+        href={`/repos/${repoId}/decisions`}
+        className="inline-flex items-center gap-1 text-xs text-[var(--color-text-tertiary)] hover:text-[var(--color-text-primary)]"
+      >
+        <ChevronLeft className="h-3.5 w-3.5" />
+        All decisions
+      </Link>
       {/* Header */}
       <div className="space-y-2">
         <div className="flex items-center gap-3">
@@ -81,23 +202,15 @@ export function DecisionDetail({ decision, repoId }: DecisionDetailProps) {
         )}
       </div>
 
-      {/* Metadata */}
+      {/* Governance linkage — writable editor + evidence card */}
       <div className="grid gap-4 sm:grid-cols-2">
-        {decision.affected_files.length > 0 && (
-          <div className="rounded-lg border border-[var(--color-border-default)] p-4">
-            <h3 className="mb-2 text-sm font-medium text-[var(--color-text-secondary)]">
-              Affected Files ({decision.affected_files.length})
-            </h3>
-            <ul className="space-y-1 text-sm text-[var(--color-text-tertiary)]">
-              {decision.affected_files.slice(0, 10).map((f) => (
-                <li key={f} className="truncate font-mono text-xs" title={f}>{f}</li>
-              ))}
-              {decision.affected_files.length > 10 && (
-                <li className="text-xs">...and {decision.affected_files.length - 10} more</li>
-              )}
-            </ul>
-          </div>
-        )}
+        <ModuleLinkEditor
+          modules={linkedModules}
+          files={linkedFiles}
+          suggestions={moduleSuggestions}
+          saving={linkageSaving}
+          onSave={saveLinkage}
+        />
 
         <div className="rounded-lg border border-[var(--color-border-default)] p-4">
           <h3 className="mb-2 text-sm font-medium text-[var(--color-text-secondary)]">Evidence</h3>
@@ -160,6 +273,18 @@ export function DecisionDetail({ decision, repoId }: DecisionDetailProps) {
           </button>
         )}
       </div>
+      {confirmConfig && (
+        <ConfirmDialog
+          open={pendingStatus !== null}
+          onOpenChange={(o) => !o && setPendingStatus(null)}
+          title={confirmConfig.title}
+          description={confirmConfig.description}
+          confirmLabel={confirmConfig.confirmLabel}
+          destructive={confirmConfig.destructive}
+          loading={loading}
+          onConfirm={() => applyStatusChange(pendingStatus!)}
+        />
+      )}
     </div>
   );
 }

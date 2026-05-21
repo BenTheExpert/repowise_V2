@@ -2,8 +2,9 @@ import type { NextConfig } from "next";
 
 const nextConfig: NextConfig = {
   output: "standalone",
+  transpilePackages: ["@repowise-dev/ui", "@repowise-dev/types"],
   experimental: {
-    optimizePackageImports: ["lucide-react", "recharts", "d3"],
+    optimizePackageImports: ["lucide-react", "recharts"],
   },
   images: {
     unoptimized: true,

@@ -15,7 +15,6 @@ import {
   Search,
   GitBranch,
   Code2,
-  BarChart3,
   Users,
   Flame,
   Trash2,
@@ -28,10 +27,10 @@ import {
   Link2,
   GitMerge,
 } from "lucide-react";
-import { Button } from "@/components/ui/button";
-import { Sheet, SheetContent, SheetHeader, SheetTitle } from "@/components/ui/sheet";
-import { ScrollArea } from "@/components/ui/scroll-area";
-import { Separator } from "@/components/ui/separator";
+import { Button } from "@repowise-dev/ui/ui/button";
+import { Sheet, SheetContent, SheetHeader, SheetTitle } from "@repowise-dev/ui/ui/sheet";
+import { ScrollArea } from "@repowise-dev/ui/ui/scroll-area";
+import { Separator } from "@repowise-dev/ui/ui/separator";
 import { AddRepoDialog } from "@/components/repos/add-repo-dialog";
 import { cn } from "@/lib/utils/cn";
 import type { RepoResponse, WorkspaceResponse } from "@/lib/api/types";
@@ -44,12 +43,11 @@ const GLOBAL_NAV = [
 function repoNavItems(repoId: string) {
   return [
     { label: "Overview", href: `/repos/${repoId}/overview`, icon: Activity },
-    { label: "Chat", href: `/repos/${repoId}`, icon: MessageSquare },
+    { label: "Chat", href: `/repos/${repoId}`, icon: MessageSquare, exact: true },
     { label: "Docs", href: `/repos/${repoId}/docs`, icon: BookOpen },
     { label: "Search", href: `/repos/${repoId}/search`, icon: Search },
     { label: "Graph", href: `/repos/${repoId}/graph`, icon: GitBranch },
     { label: "Symbols", href: `/repos/${repoId}/symbols`, icon: Code2 },
-    { label: "Coverage", href: `/repos/${repoId}/coverage`, icon: BarChart3 },
     { label: "Ownership", href: `/repos/${repoId}/ownership`, icon: Users },
     { label: "Hotspots", href: `/repos/${repoId}/hotspots`, icon: Flame },
     { label: "Dead Code", href: `/repos/${repoId}/dead-code`, icon: Trash2 },
@@ -60,7 +58,7 @@ function repoNavItems(repoId: string) {
 }
 
 const WORKSPACE_NAV = [
-  { label: "Overview", href: "/workspace", icon: Layers },
+  { label: "Overview", href: "/workspace", icon: Layers, exact: true as const },
   { label: "Contracts", href: "/workspace/contracts", icon: Link2 },
   { label: "Co-Changes", href: "/workspace/co-changes", icon: GitMerge },
 ];
@@ -74,7 +72,23 @@ export function MobileNav({ repos = [], workspace }: MobileNavProps) {
   const isWorkspace = workspace?.is_workspace ?? false;
   const [open, setOpen] = React.useState(false);
   const pathname = usePathname();
-  const [expandedRepos, setExpandedRepos] = React.useState<Set<string>>(new Set());
+  const activeRepoId = React.useMemo(() => {
+    const m = pathname?.match(/^\/repos\/([^/]+)/);
+    return m ? m[1] : undefined;
+  }, [pathname]);
+  const [expandedRepos, setExpandedRepos] = React.useState<Set<string>>(
+    activeRepoId ? new Set([activeRepoId]) : new Set(),
+  );
+  React.useEffect(() => {
+    if (activeRepoId) {
+      setExpandedRepos((prev) => {
+        if (prev.has(activeRepoId)) return prev;
+        const next = new Set(prev);
+        next.add(activeRepoId);
+        return next;
+      });
+    }
+  }, [activeRepoId]);
 
   const toggleRepo = (id: string) => {
     setExpandedRepos((prev) => {
@@ -91,17 +105,17 @@ export function MobileNav({ repos = [], workspace }: MobileNavProps) {
   }, [pathname]);
 
   return (
-    <div className="flex md:hidden h-14 items-center gap-3 px-4 border-b border-[var(--color-border-default)] bg-[var(--color-bg-surface)] shrink-0">
+    <div className="flex md:hidden min-h-14 items-center gap-3 px-4 border-b border-[var(--color-border-default)] bg-[var(--color-bg-surface)] shrink-0">
       <Button
         variant="ghost"
         size="icon"
         onClick={() => setOpen(true)}
         aria-label="Open navigation menu"
-        className="h-9 w-9"
+        className="h-11 w-11"
       >
         <Menu className="h-5 w-5" />
       </Button>
-      <div className="flex items-center gap-2 min-w-0">
+      <div className="flex items-center gap-2 min-w-0 flex-1">
         <Image
           src="/repowise-logo.png"
           alt="repowise"
@@ -113,9 +127,20 @@ export function MobileNav({ repos = [], workspace }: MobileNavProps) {
           repowise
         </span>
       </div>
+      <Button
+        variant="ghost"
+        size="icon"
+        onClick={() => {
+          window.dispatchEvent(new CustomEvent("repowise:open-command-palette"));
+        }}
+        aria-label="Open search"
+        className="h-11 w-11"
+      >
+        <Search className="h-5 w-5" />
+      </Button>
 
       <Sheet open={open} onOpenChange={setOpen}>
-        <SheetContent side="left" className="p-0">
+        <SheetContent side="left" className="w-72 p-0">
           <SheetHeader className="border-b border-[var(--color-border-default)] h-14 flex-row items-center gap-3 py-0 px-4">
             <Image
               src="/repowise-logo.png"
@@ -160,10 +185,9 @@ export function MobileNav({ repos = [], workspace }: MobileNavProps) {
                   <nav className="space-y-1">
                     {WORKSPACE_NAV.map((item) => {
                       const Icon = item.icon;
-                      const isActive =
-                        item.href === "/workspace"
-                          ? pathname === "/workspace"
-                          : pathname.startsWith(`${item.href}`);
+                      const isActive = (item as { exact?: boolean }).exact
+                        ? pathname === item.href
+                        : pathname.startsWith(`${item.href}`);
                       return (
                         <Link
                           key={item.href}
@@ -198,6 +222,7 @@ export function MobileNav({ repos = [], workspace }: MobileNavProps) {
                         <div key={repo.id}>
                           <button
                             onClick={() => toggleRepo(repo.id)}
+                            aria-expanded={isExpanded}
                             className="flex w-full items-center gap-2.5 rounded-lg px-2 py-2 text-sm transition-colors hover:bg-[var(--color-bg-elevated)] text-[var(--color-text-secondary)]"
                           >
                             <Circle className="h-2 w-2 shrink-0 fill-[var(--color-text-tertiary)] text-[var(--color-text-tertiary)]" />
@@ -214,9 +239,9 @@ export function MobileNav({ repos = [], workspace }: MobileNavProps) {
                             <div className="ml-3.5 mt-0.5 space-y-0.5 border-l border-[var(--color-border-default)] pl-3">
                               {navItems.map((item) => {
                                 const Icon = item.icon;
-                                const isActive =
-                                  pathname === item.href ||
-                                  pathname.startsWith(`${item.href}/`);
+                                const isActive = (item as { exact?: boolean }).exact
+                                  ? pathname === item.href
+                                  : pathname === item.href || pathname.startsWith(`${item.href}/`);
                                 return (
                                   <Link
                                     key={item.href}

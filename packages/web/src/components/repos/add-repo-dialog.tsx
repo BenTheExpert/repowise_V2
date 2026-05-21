@@ -4,16 +4,16 @@ import { useState } from "react";
 import { Plus } from "lucide-react";
 import { useSWRConfig } from "swr";
 import { createRepo } from "@/lib/api/repos";
-import { Button } from "@/components/ui/button";
+import { Button } from "@repowise-dev/ui/ui/button";
 import {
   Dialog,
   DialogContent,
   DialogHeader,
   DialogTitle,
   DialogFooter,
-} from "@/components/ui/dialog";
-import { Label } from "@/components/ui/label";
-import { Input } from "@/components/ui/input";
+} from "@repowise-dev/ui/ui/dialog";
+import { Label } from "@repowise-dev/ui/ui/label";
+import { Input } from "@repowise-dev/ui/ui/input";
 
 interface Props {
   /** Render as a sidebar button (icon + label) vs standalone button */
@@ -63,29 +63,24 @@ export function AddRepoDialog({ variant = "default" }: Props) {
 
   return (
     <>
-      <button
-        onClick={() => setOpen(true)}
-        className={
-          variant === "sidebar"
-            ? "flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-xs text-[var(--color-text-tertiary)] hover:bg-[var(--color-bg-elevated)] hover:text-[var(--color-text-secondary)] transition-colors"
-            : undefined
-        }
-      >
-        {variant === "sidebar" ? (
-          <>
-            <Plus className="h-3.5 w-3.5 shrink-0" />
-            <span>Add Repository</span>
-          </>
-        ) : (
-          <Button variant="default" size="sm">
-            <Plus className="h-4 w-4 mr-1" />
-            Add Repository
-          </Button>
-        )}
-      </button>
+      {variant === "sidebar" ? (
+        <button
+          type="button"
+          onClick={() => setOpen(true)}
+          className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-xs text-[var(--color-text-tertiary)] hover:bg-[var(--color-bg-elevated)] hover:text-[var(--color-text-secondary)] transition-colors"
+        >
+          <Plus className="h-3.5 w-3.5 shrink-0" />
+          <span>Add Repository</span>
+        </button>
+      ) : (
+        <Button variant="default" size="sm" onClick={() => setOpen(true)}>
+          <Plus className="h-4 w-4 mr-1" />
+          Add Repository
+        </Button>
+      )}
 
       <Dialog open={open} onOpenChange={(v) => { setOpen(v); if (!v) reset(); }}>
-        <DialogContent className="sm:max-w-md">
+        <DialogContent className="sm:max-w-md w-[calc(100vw-2rem)]">
           <DialogHeader>
             <DialogTitle>Add Repository</DialogTitle>
           </DialogHeader>

@@ -4,10 +4,12 @@ import { useState } from "react";
 import useSWR from "swr";
 import { useParams } from "next/navigation";
 import { Trash2 } from "lucide-react";
-import { Button } from "@/components/ui/button";
-import { SummaryBar } from "@/components/dead-code/summary-bar";
+import { RoutedToRiskBanner } from "@/components/risk/routed-to-risk-banner";
+import { toast } from "sonner";
+import { Button } from "@repowise-dev/ui/ui/button";
+import { SummaryBar } from "@repowise-dev/ui/dead-code/summary-bar";
 import { FindingsTable } from "@/components/dead-code/findings-table";
-import { Skeleton } from "@/components/ui/skeleton";
+import { Skeleton } from "@repowise-dev/ui/ui/skeleton";
 import { getDeadCodeSummary, analyzeDeadCode } from "@/lib/api/dead-code";
 import type { DeadCodeSummaryResponse } from "@/lib/api/types";
 
@@ -15,9 +17,8 @@ export default function DeadCodePage() {
   const params = useParams<{ id: string }>();
   const id = params.id;
   const [analyzing, setAnalyzing] = useState(false);
-  const [analyzeMsg, setAnalyzeMsg] = useState("");
 
-  const { data: summary, isLoading: loadingSummary } = useSWR<DeadCodeSummaryResponse>(
+  const { data: summary, isLoading: loadingSummary, error: summaryError, mutate: mutateSummary } = useSWR<DeadCodeSummaryResponse>(
     `dead-code-summary:${id}`,
     () => getDeadCodeSummary(id),
     { revalidateOnFocus: false },
@@ -25,12 +26,13 @@ export default function DeadCodePage() {
 
   const handleAnalyze = async () => {
     setAnalyzing(true);
-    setAnalyzeMsg("");
     try {
       await analyzeDeadCode(id);
-      setAnalyzeMsg("Analysis started — results will appear shortly.");
-    } catch {
-      setAnalyzeMsg("Failed to start analysis.");
+      toast.success("Analysis started — results will appear shortly.");
+    } catch (err) {
+      toast.error(
+        err instanceof Error ? `Couldn't start analysis: ${err.message}` : "Couldn't start analysis",
+      );
     } finally {
       setAnalyzing(false);
     }
@@ -38,6 +40,7 @@ export default function DeadCodePage() {
 
   return (
     <div className="p-4 sm:p-6 space-y-6 max-w-[1600px]">
+      <RoutedToRiskBanner repoId={id} tab="dead-code" />
       <div className="flex flex-wrap items-start justify-between gap-4">
         <div>
           <h1 className="text-xl font-semibold text-[var(--color-text-primary)] mb-1 flex items-center gap-2">
@@ -49,9 +52,6 @@ export default function DeadCodePage() {
           </p>
         </div>
         <div className="flex items-center gap-3">
-          {analyzeMsg && (
-            <span className="text-xs text-green-500">{analyzeMsg}</span>
-          )}
           <Button
             size="sm"
             variant="outline"
@@ -71,6 +71,13 @@ export default function DeadCodePage() {
         </div>
       ) : summary ? (
         <SummaryBar summary={summary} />
+      ) : summaryError ? (
+        <div className="rounded-lg border border-[var(--color-border-default)] bg-[var(--color-bg-elevated)] p-4 text-sm text-[var(--color-text-secondary)] flex items-center justify-between gap-2">
+          <span>Couldn&apos;t load summary.</span>
+          <Button size="sm" variant="outline" onClick={() => mutateSummary()}>
+            Retry
+          </Button>
+        </div>
       ) : null}
 
       <FindingsTable repoId={id} />

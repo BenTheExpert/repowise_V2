@@ -1,9 +1,9 @@
 <div align="center">
 
 <img src=".github/assets/logo.png" width="280" alt="repowise" /><br />
-**Codebase intelligence for AI-assisted engineering teams.**
+**The codebase intelligence layer for your AI coding agent.**
 
-Four intelligence layers. Seven MCP tools. Multi-repo workspaces. Auto-sync hooks. One `pip install`.
+Five intelligence layers. Nine MCP tools. Multi-repo workspaces. Auto-sync hooks. One `pip install`.
 
 [![PyPI version](https://img.shields.io/pypi/v/repowise?color=F59520&labelColor=0A0A0A)](https://pypi.org/project/repowise/)
 [![License: AGPL v3](https://img.shields.io/badge/license-AGPL--v3-F59520?labelColor=0A0A0A)](https://www.gnu.org/licenses/agpl-3.0)
@@ -11,7 +11,7 @@ Four intelligence layers. Seven MCP tools. Multi-repo workspaces. Auto-sync hook
 [![MCP](https://img.shields.io/badge/MCP-compatible-F59520?labelColor=0A0A0A)](https://modelcontextprotocol.io)
 [![Stars](https://img.shields.io/github/stars/repowise-dev/repowise?color=F59520&labelColor=0A0A0A)](https://github.com/repowise-dev/repowise)
 
-[**Live Demo →**](https://repowise.dev/examples) · [**Hosted for teams**](https://www.repowise.dev/#contact) · [**Docs**](https://repowise-dev.github.io) · [**Discord**](https://discord.gg/cQVpuDB6rh) · [**Contact**](mailto:hello@repowise.dev)
+[**Explore real codebases →**](https://www.repowise.dev/explore) · [**Hosted for teams →**](https://www.repowise.dev/#contact) · [**Docs**](https://docs.repowise.dev) · [**Discord**](https://discord.gg/cQVpuDB6rh) · [**Contact**](mailto:hello@repowise.dev)
 
 ---
 
@@ -21,9 +21,9 @@ Four intelligence layers. Seven MCP tools. Multi-repo workspaces. Auto-sync hook
 
 </div>
 
-Your AI coding agent reads files. It does not know who owns them, which ones change together, which ones are dead, or why they were built the way they were. It has the source code and zero institutional knowledge.
+Your AI coding agent reads files. It doesn't know which ones change together, which ones are dead, or why they were built the way they were. It has the source code and no memory of how the codebase got there.
 
-repowise fixes that. It indexes your codebase into four intelligence layers — dependency graph, git history, auto-generated documentation, and architectural decisions — and exposes them to Claude Code (and any MCP-compatible AI agent) through seven precisely designed tools. Multi-repo? Initialize a workspace and get cross-repo co-change detection, API contract extraction, and federated MCP queries across all your services. **27× fewer tokens per query. 36% cheaper. Same answer quality.**
+repowise fixes that. It indexes your codebase into four intelligence layers — dependency graph, git history, auto-generated documentation, and architectural decisions — and exposes them to Claude Code (and any MCP-compatible AI agent) through eight precisely designed tools. Multi-repo? Initialize a workspace and get cross-repo co-change detection, API contract extraction, and federated MCP queries across all your services. **27× fewer tokens per query. 36% cheaper. Same answer quality.**
 
 The result: your agent answers *"why does auth work this way?"* instead of *"here is what auth.ts contains."*
 
@@ -68,7 +68,7 @@ repowise runs once, builds everything, then keeps it in sync on every commit.
 tree-sitter parses every file across 14 languages into a two-tier dependency graph — file nodes and symbol nodes (functions, classes, methods). A 3-tier call resolver with confidence scoring handles import aliases, barrel re-exports, and namespace imports. Heritage extraction covers extends, implements, trait impls, derive macros, mixins, and extension conformance. Leiden community detection finds logical modules even when your directory structure doesn't reflect them. PageRank, betweenness centrality, SCC analysis, and execution flow tracing from entry points identify your most central, most coupled, and most traversed code.
 
 ### ◈ Git Intelligence
-500 commits of history turned into signals: hotspot files (high churn × high complexity), ownership percentages per engineer, co-change pairs (files that change together without an import link — hidden coupling), and significant commit messages that explain *why* code evolved.
+Your git history turned into signals: hotspot files (high churn × high complexity), ownership percentages per author, co-change pairs (files that change together without an import link — hidden coupling), and significant commit messages that explain *why* code evolved. Rolled up into **contributor profiles** (per-author module rollups, top files, co-authors, silo modules, dead-code burden), **module health scorecards** (composite score over churn × ownership × docs × dead code × bus factor), and **reviewer suggestions** for any PR file list, weighted by direct authorship, co-change history, and recency.
 
 ### ◈ Documentation Intelligence
 An LLM-generated wiki for every module and file, rebuilt incrementally on every commit. Coverage tracking. Freshness scoring per page. Semantic search via RAG. Confidence scores show how current each page is relative to the underlying code.
@@ -84,12 +84,33 @@ The layer nobody else has. Architectural decisions captured from git history, in
 
 These become structured decision records, queryable by Claude Code via `get_why()`.
 
+### ◈ Code Health Intelligence
+Twelve deterministic biomarkers compute a 1–10 health score per file — McCabe complexity, deep nesting, brain methods, native Rabin–Karp duplication detection, untested hotspots, primitive obsession, developer congestion, knowledge loss, and more. **Zero LLM calls, zero new runtime dependencies** — pure Python over tree-sitter and git data, designed to finish in under 30 seconds on a 3 000-file repo.
+
+Ingest LCOV, Cobertura, or Clover coverage reports to light up the test-coverage biomarkers. Rolling 50-row snapshot history powers `Declining Health` and `Predicted Decline` alerts. Deterministic, rule-based refactoring suggestions surface on the dashboard and via `get_health(include=["refactoring"])`. Per-file overrides via `.repowise/health-rules.json`.
+
+```bash
+repowise health                       # KPIs + lowest-scoring files
+repowise health --coverage cov.lcov   # ingest coverage, light up untested-hotspot
+repowise health --refactoring-targets # ranked by impact / effort
+repowise health --trend               # last 10 snapshots + alerts
+repowise status                       # one-line summary in the status report
+```
+
+See [`docs/CODE_HEALTH.md`](docs/CODE_HEALTH.md) for the user guide and [`docs/architecture/code-health.md`](docs/architecture/code-health.md) for the internals.
+
 ---
 
 ## Quickstart
 
 ```bash
 pip install repowise
+```
+
+Or install the CLI into an isolated, uv-managed environment:
+
+```bash
+uv tool install repowise
 ```
 
 ### Single repo
@@ -123,9 +144,9 @@ To manually add the MCP server to another editor:
 }
 ```
 
-> **Note on init time:** Initial indexing analyzes your entire codebase — AST parsing, 500-commit git history, LLM doc generation, embedding indexing, and decision archaeology. This is a one-time cost (~25 minutes for a 3,000-file project). Every subsequent update after a commit takes under 30 seconds and only regenerates the few pages affected by your changes.
+> **Note on init time:** Initial indexing analyzes your entire codebase — AST parsing, git-history mining, LLM doc generation, embedding indexing, and decision archaeology. This is a one-time cost (~25 minutes for a 3,000-file project). Every subsequent update after a commit takes under 30 seconds and only regenerates the few pages affected by your changes.
 
-> **Full docs:** [Quickstart](docs/QUICKSTART.md) · [User Guide](docs/USER_GUIDE.md) · [CLI Reference](docs/CLI_REFERENCE.md) · [MCP Tools](docs/MCP_TOOLS.md) · [Workspaces](docs/WORKSPACES.md) · [Auto-Sync](docs/AUTO_SYNC.md)
+> **Full docs:** [Quickstart](docs/QUICKSTART.md) · [User Guide](docs/USER_GUIDE.md) · [CLI Reference](docs/CLI_REFERENCE.md) · [MCP Tools](docs/MCP_TOOLS.md) · [Workspaces](docs/WORKSPACES.md) · [Computed Glossary](docs/COMPUTED_GLOSSARY.md) · [Auto-Sync](docs/AUTO_SYNC.md)
 
 ---
 
@@ -153,31 +174,37 @@ repowise init .           # scan, select repos, index each, run cross-repo analy
 
 ```bash
 repowise workspace list                  # show all repos and their status
-repowise workspace add ../new-service    # add a repo to the workspace
+repowise workspace add ../new-service    # add a repo (auto-indexes + docs by default)
 repowise workspace remove api-gateway    # remove a repo (doesn't delete files)
 repowise workspace scan                  # re-scan for new repos
-repowise update --workspace              # update all stale repos + cross-repo analysis
+repowise update --workspace              # update all stale repos + first-time index any new ones
+repowise update --repo backend           # scope to one repo (auto-detected from cwd too)
 repowise watch --workspace               # auto-update all repos on file change
+repowise doctor --workspace --repair     # validate every repo; sync state drift; drop dead entries
 repowise hook install --workspace        # install post-commit hooks for all repos
 ```
+
+Most commands also accept `--no-workspace` to force single-repo mode and `--repo <alias>` to scope to one repo. See [CLI Reference](docs/CLI_REFERENCE.md#workspace-auto-detect-cross-cutting).
 
 Full guide: [docs/WORKSPACES.md](docs/WORKSPACES.md)
 
 ---
 
-## Seven MCP tools
+## Nine MCP tools
 
-Most tools are designed around data entities — one module, one file, one symbol — which forces AI agents into long chains of sequential calls. repowise tools are designed around **tasks**. Pass multiple targets in one call. Get complete context back. Full reference: [docs/MCP_TOOLS.md](docs/MCP_TOOLS.md)
+Most tools are designed around data entities — one module, one file, one symbol — which forces AI agents into long chains of sequential calls. repowise tools are designed around **tasks**. Pass multiple targets in one call. Get complete context back. Every response carries an `_meta` envelope with `index_age_days`, `indexed_commit`, and a `stale_warning` that fires only when the indexed HEAD diverges from live `.git/HEAD` — silence means the index is current. Full reference: [docs/MCP_TOOLS.md](docs/MCP_TOOLS.md)
 
-| Tool | What it answers | When Claude Code calls it |
+| Tool | What only this tool answers | When Claude Code calls it |
 |---|---|---|
 | `get_overview()` | Architecture summary, module map, entry points, git health, community summary | First call on any unfamiliar codebase |
-| `get_answer(question)` | One-call RAG: retrieves over the wiki, gates on confidence, and synthesizes a cited 2–5 sentence answer. High-confidence answers cite directly; ambiguous queries return ranked excerpts. | First call on any code question — collapses search → read → reason into one round-trip |
-| `get_context(targets, include?)` | The workhorse. Docs, symbols, ownership, freshness, community membership for any targets. `include` options: `"source"` (symbol body), `"callers"`/`"callees"` (call graph), `"metrics"` (PageRank, centrality), `"community"` (cluster membership). Batch multiple targets. In workspace mode, pass `repo` to target a specific repo. | Before reading or modifying code. Pass all relevant targets in one call. |
-| `search_codebase(query)` | Semantic search over the full wiki. Natural language. In workspace mode, searches across all repos. | When `get_answer` returned low confidence and you need to discover candidate pages by topic |
-| `get_risk(targets?, changed_files?)` | Hotspot scores, dependents, co-change partners, blast radius, recommended reviewers, test gaps, security signals, 0–10 risk score | Before modifying files — understand what could break |
-| `get_why(query?)` | Three modes: NL search over decisions · path-based decisions for a file · no-arg health dashboard | Before architectural changes — understand existing intent |
-| `get_dead_code(min_confidence?, include_internals?)` | Unreachable code sorted by confidence tier with cleanup impact estimates | Cleanup tasks |
+| `get_answer(question)` | Hybrid retrieval (FTS + vector merged via RRF) plus PageRank bias and 1-hop graph expansion, synthesised into a cited answer with a calibrated `retrieval_quality` reported separately from `confidence`. On low confidence returns a structured `best_guesses` list with one-line per-file justifications instead of an empty answer. Decision records are fused in for "why"-shaped questions. | First call on any code question — collapses search → read → reason into one round-trip |
+| `get_context(targets, include?)` | Triage card for files / modules / symbols: title, summary, signatures, `hotspot` bit, `decision_records` titles, and `symbol_id`s the agent pipes into `get_symbol`. NOT source bytes. `include` opens richer data: `"callers"`/`"callees"`, `"ownership"`, `"last_change"`, `"metrics"`, `"community"`, `"decisions"`, `"full_doc"`. Batch multiple targets. | Before reading or modifying code. Pass all relevant targets in one call. |
+| `get_symbol("path/to/file.py::Name")` | Raw source bytes for one indexed symbol with exact line bounds — cheaper and safer than `Read` + offset math. Bounded at ~400 lines, normalises `::` / `.` / `/` separators across languages, deterministic resolution on overloads. | When you need the body of one function or class. Use the `symbol_id` returned by `get_context`. |
+| `search_codebase(query, kind?)` | Semantic search over the wiki. Each result tags its `search_method` (`"embedding"` vs `"bm25"` fallback) and is filterable by `kind` (`implementation` / `test` / `config` / `doc`). Surfaces a Grep hint when the query is a bareword identifier. | When `get_answer` returned low confidence and you need to discover candidate pages by topic |
+| `get_risk(targets, changed_files?)` | Hotspot scores, dependents, co-change partners, ownership, test gaps, security signals. Pass `changed_files` for PR mode → response carries a `directive` block (`will_break`, `missing_cochanges`, `missing_tests`) for one-glance review plus cross-repo blast radius. | Before modifying files — understand what could break |
+| `get_why(query?, targets?)` | Architectural decision records, their status (active / proposed / deprecated / superseded), and the commits that are evidence for them. Falls back to git archaeology when no ADRs exist for a file. | Before architectural changes — understand existing intent |
+| `get_dead_code(min_confidence?, include_internals?)` | Unreachable code sorted by confidence tier with cleanup impact estimates. In workspace mode, cross-repo consumer detection lowers confidence on findings that other repos import. | Cleanup tasks |
+| `get_health(targets?, include?)` | Twelve deterministic biomarker scores per file. Dashboard mode returns KPIs + the lowest-scoring files + a per-module NLOC-weighted rollup; targeted mode returns per-file findings. `include` flags layer richer data: `"coverage"`, `"refactoring"` (rule-based suggestions), `"trend"` (snapshot diff + declining/predicted-decline alerts). `module:foo` targets expand to a module's file set. | Before refactoring — find the worst-scoring files and what to fix first |
 
 ### Tool call comparison — a real task
 
@@ -186,7 +213,7 @@ Most tools are designed around data entities — one module, one file, one symbo
 | Approach | Tool calls | Time to first change | What it misses |
 |---|---|---|---|
 | Claude Code alone (no MCP) | grep + read ~30 files | ~8 min | Ownership, prior decisions, hidden coupling |
-| **repowise (7 tools)** | **5 calls** | **~2 min** | **Nothing** |
+| **repowise (9 tools)** | **5 calls** | **~2 min** | **Nothing** |
 
 The 5 calls for that task:
 
@@ -245,15 +272,19 @@ This is what happens when an AI agent has real codebase intelligence.
 | **Chat** | Ask anything about your codebase in natural language |
 | **Docs** | AI-generated wiki with syntax highlighting, Mermaid diagrams, and a graph intelligence sidebar showing PageRank/betweenness percentiles, community membership, and degree |
 | **Graph** | Interactive dependency graph — handles 2,000+ nodes. Community color mode with real labels, community detail panel on click, path finder |
+| **C4 Architecture** | C4-model view of the codebase (Context → Containers → Components) with drill-down, URL-synced state, and a per-node detail panel that surfaces module health, top contributors, and the generated wiki page inline |
 | **Search** | Full-text and semantic search with global command palette (Ctrl+K) |
-| **Symbols** | Searchable index of every function, class, and method. Click any symbol for graph metrics, callers/callees, and class heritage |
+| **Symbols** | Searchable index of every function, class, and method, server-ranked by importance (PageRank × visibility × complexity × kind × entry-point). Filter facets for public-only, language, kind, in-hotspot-files, and in-entry-point-files. Click any symbol for graph metrics, callers/callees, class heritage, and a git panel with governing decisions |
 | **Coverage** | Doc freshness per file with one-click regeneration |
-| **Ownership** | Contributor attribution and bus factor risk |
-| **Hotspots** | Ranked by trend-weighted score (180-day decay) and churn |
-| **Dead Code** | Unused code with confidence scores and bulk actions |
-| **Decisions** | Architectural decisions with staleness monitoring |
+| **Risk** | One page, six tabs: Hotspots (with inline drill-down to the top importance-ranked symbols in each file), Heatmap (ownership treemap with bus-factor borders and silo overlay), Module Health, Dead Code, Impact (blast radius), and the always-visible risk strip linking to each |
+| **Contributors** | Paginated contributor directory and per-author profile pages — modules they own, top files, co-authors, commit category mix, silo modules, bus-factor risk files, and dead-code burden. Click any owner anywhere in the dashboard to drill in |
+| **Module Health** | Per-module rollup with a composite health score (churn / ownership / docs / dead code / bus factor), sortable list, and a per-module detail page showing owners, top hotspots, and governing decisions |
+| **Hotspots** | Ranked by trend-weighted score (180-day decay) and churn. Paginated load-more; each row expands inline to the most important symbols in that file |
+| **Dead Code** | Unused code with confidence scores, owner leaderboard, and bulk actions |
+| **Decisions** | Architectural decisions with staleness monitoring. Decision detail has a writable module-linkage editor so a decision's governance scope can be edited and shows up on the linked module's health page |
 | **Costs** | LLM spend by day, model, or operation, with running session totals |
-| **Blast Radius** | Paste a PR file list, see transitive impact, reviewers, and test gaps |
+| **Blast Radius** | Paste a PR file list, see transitive impact, test gaps, and a ranked reviewer-suggestions panel weighted by direct authorship, co-change history, and recency |
+| **Security** | Local regex-based scan for dangerous patterns — `eval`/`exec`/`pickle.loads`/`shell=True`/`os.system`, hardcoded secrets, f-string and concat SQL, `verify=False`, weak hashes — surfaced with severity and grouped by directory. Runs in seconds, no LLM, no network |
 | **Knowledge Map** | Top owners, bus-factor silos, and onboarding targets on the dashboard |
 | **Graph Intelligence** | Architecture communities with expandable detail, execution flows with call traces, community coupling analysis — all on the overview dashboard |
 | **Workspace Dashboard** | Aggregate stats across repos, repo cards, cross-repo intelligence summary (workspace mode) |
@@ -358,7 +389,7 @@ Monorepo with 4 packages. Entry points: api/server.ts, cli/index.ts.
 - CircuitBreaker on all external calls — after payment provider outages in Q3 2024
 
 ## Hidden coupling (no import link, but change together)
-- auth.ts ↔ middleware/session.ts — co-changed 31 times in last 500 commits
+- auth.ts ↔ middleware/session.ts — co-changed 31 times
 <!-- REPOWISE:END -->
 ```
 
@@ -366,17 +397,23 @@ Monorepo with 4 packages. Entry points: api/server.ts, cli/index.ts.
 
 ## Git intelligence
 
-repowise mines your last 500 commits (configurable) to produce signals no static analysis can find.
+repowise mines your git history (per-file, configurable depth) to produce signals no static analysis can find.
 
 **Hotspots** — files in the top 25% of both churn and complexity. These are where bugs live. Flagged in the dashboard, in CLAUDE.md, and surfaced by `get_risk()` before Claude Code touches them.
 
-**Ownership** — `git blame` aggregated into ownership percentages per engineer. Know who to ping. Know where knowledge silos exist.
+**Ownership** — `git blame` aggregated into ownership percentages per author. Know who to ping. Know where knowledge silos exist.
 
 **Co-change pairs** — files that change together in the same commit without an import link. Hidden coupling that AST parsing cannot detect. `get_context()` surfaces co-change partners alongside direct dependencies.
 
-**Bus factor** — files owned >80% by a single engineer. Shown in the ownership view. Surfaced in CLAUDE.md as knowledge risk.
+**Bus factor** — files owned >80% by a single author. Shown in the ownership view. Surfaced in CLAUDE.md as knowledge risk.
 
 **Significant commits** — the last 10 meaningful commit messages per file (filtered: no merges, no dependency bumps, no lint) are included in generation prompts. The LLM explains *why* code is structured the way it is.
+
+**Contributor profiles** — every author with commits gets a profile page: modules they own, top files, co-authors, commit category mix (feat / fix / refactor / docs / test / chore / perf), silo modules they're solely on, bus-factor risk files, and dead-code burden. Surfaced via `/repos/<id>/owners` in the dashboard and linked from every owner reference.
+
+**Module health** — composite 0–100 score per top-level module derived from silo penalty, hotspot density, dead-code percentage, average churn, doc coverage, and median bus factor. Surfaced on the Risk page and the per-module detail page, with cross-links to owners, hotspots, and governing decisions.
+
+**Reviewer suggestions** — paste a PR file list into Blast Radius and get a ranked list of likely reviewers, scored by direct authorship (×1.0), co-change partners (×0.5), and recency (×0.4), capped at the 5 strongest co-change signals per file.
 
 ---
 
@@ -396,7 +433,7 @@ repowise dead-code
   ✗ analytics/v1/tracker.ts         file      0.41   recent activity — review first
 ```
 
-Conservative by design. `safe_to_delete` requires confidence ≥ 0.70 and excludes dynamically-loaded patterns (`*Plugin`, `*Handler`, `*Adapter`, `*Middleware`). Dynamic import detection (`importlib.import_module()`, `__import__()`) and framework decorator awareness (Flask/FastAPI/Django routes) further reduce false positives. repowise surfaces candidates. Engineers decide.
+Conservative by design. `safe_to_delete` requires confidence ≥ 0.70 and excludes dynamically-loaded patterns (`*Plugin`, `*Handler`, `*Adapter`, `*Middleware`). Dynamic import detection (`importlib.import_module()`, `__import__()`) and framework awareness (Flask/FastAPI/Django/Rails/Laravel/TYPO3 routes and convention files) further reduce false positives. repowise surfaces candidates. Engineers decide.
 
 ---
 
@@ -424,7 +461,7 @@ repowise decision health
 
 Decisions are linked to graph nodes, tracked for staleness as code evolves, and surfaced by `get_why()` whenever Claude Code touches governed files.
 
-When a senior engineer leaves, the "why" usually leaves with them. Decision intelligence keeps it in the codebase.
+The "why" usually walks out the door — when a teammate leaves, or when you reopen your own repo six months later. Decision intelligence keeps it in the codebase.
 
 ---
 
@@ -436,11 +473,20 @@ When a senior engineer leaves, the "why" usually leaves with them. Decision inte
 | Auto-generated documentation | ✅ | ✅ Gemini | ✅ | ✅ PR2Doc | ❌ |
 | Private repo — no cloud | ✅ | ❌ in development | ❌ OSS forks only | ✅ Enterprise tier | ✅ |
 | Dead code detection | ✅ | ❌ | ❌ | ❌ | ❌ |
+| Code health score (1–10) | ✅ 12 biomarkers | ❌ | ❌ | ❌ | ✅ 25–30 |
+| Brain Method detection | ✅ | ❌ | ❌ | ❌ | ✅ |
+| Complexity biomarkers | ✅ native tree-sitter | ❌ | ❌ | ❌ | ✅ |
+| Test coverage intelligence | ✅ LCOV/Cobertura/Clover | ❌ | ❌ | ❌ | ❌ |
+| Untested hotspot detection | ✅ coverage × hotspot | ❌ | ❌ | ❌ | ❌ |
+| DRY violation detection | ✅ native (no npm) | ❌ | ❌ | ❌ | ✅ |
+| Health trend tracking | ✅ rolling 50 snapshots | ❌ | ❌ | ❌ | ✅ |
+| Declining health alerts | ✅ | ❌ | ❌ | ❌ | ✅ |
+| Refactoring recommendations | ✅ deterministic | ❌ | ❌ | ❌ | ✅ |
 | Git intelligence (hotspots, ownership, co-changes) | ✅ | ❌ | ❌ | ❌ | ✅ |
 | Bus factor analysis | ✅ | ❌ | ❌ | ❌ | ✅ |
 | Architectural decision records | ✅ | ❌ | ❌ | ❌ | ❌ |
 | Multi-repo workspace intelligence | ✅ co-changes, contracts, federated MCP | ❌ | ❌ | ❌ | ❌ |
-| MCP server for AI agents | ✅ 7 tools | ❌ | ✅ 3 tools | ✅ | ✅ |
+| MCP server for AI agents | ✅ 9 tools | ❌ | ✅ 3 tools | ✅ | ✅ |
 | Proactive agent hooks | ✅ PreToolUse + PostToolUse | ❌ | ❌ | ❌ | ❌ |
 | Auto-generated CLAUDE.md | ✅ | ❌ | ❌ | ❌ | ❌ |
 | Doc freshness scoring | ✅ | ❌ | ❌ | ⚠️ staleness only | ❌ |
@@ -461,17 +507,17 @@ repowise is the intersection: CodeScene-level git intelligence + auto-generated 
 
 ## Hosted version — for teams
 
-For teams that want repowise managed, we offer a hosted version. No self-hosting, no infrastructure to maintain — we handle deployment, updates, and webhooks. If your team wants shared codebase intelligence without the operational overhead, reach out.
+[**repowise.dev**](https://www.repowise.dev) is the same engine, fully managed. Now at feature parity with self-hosted: every CLI command, every MCP tool, the full dashboard. Connect your IDE to the hosted MCP endpoint and skip the install entirely.
 
-Hosted adds what only makes sense in a managed, multi-user environment:
+We use it on our own codebase — see the live snapshot of repowise indexing itself: [**dogfood example →**](https://www.repowise.dev/s/5a6b93fa9a69). More public repos indexed on the [**explore page →**](https://www.repowise.dev/explore).
 
-- **Shared team context layer** — one CLAUDE.md backed by the full graph and decision layer, auto-injected into every team member's Claude Code session via MCP
-- **Session intelligence harvesting** — architectural decisions extracted from AI coding sessions and proposed to the team knowledge base automatically
-- **Security vulnerability reporting** — repowise scans for known vulnerability patterns, dependency risks, and security anti-patterns across your codebase and surfaces them proactively. Not just `eval` calls — real CVE-aware analysis
-- **Engineering leader dashboard** — bus factor trends, hotspot evolution over time, cross-repo dead code, ownership drift
-- **Managed webhooks** — zero-configuration auto re-index on every commit to any branch
-- **Integrations** — Slack alerts, Jira and Linear decision linking, Confluence and Notion doc sync, GitHub and GitLab webhooks, PagerDuty escalation routing
-- **Cross-repo intelligence at scale** — hotspots, dead code, and ownership across all your repositories with centralized dashboards (beyond what local workspaces provide)
+**What you get on top of self-hosting:**
+- **Zero ops** — managed deploys, managed webhooks, auto re-index on every commit, no infrastructure
+- **Hosted MCP endpoint** — point Claude Code (or any MCP client) at one URL, no local server to run
+- **Repowise PR Bot** — free GitHub App that posts one deterministic comment per pull request (hotspot touches, hidden coupling, declining health, dead code). Zero LLM calls — same engine, just running on your PRs. [Install →](https://github.com/apps/repowise-bot) · [Learn more →](https://www.repowise.dev/bot)
+- **CVE-aware security layer** — on top of the local pattern scan, the hosted version adds CVE-aware vulnerability detection, dependency risk surfacing, and cross-repo security anti-pattern analysis
+- **Cross-repo intelligence at scale** — federated hotspots, dead code, and ownership across all your repos in one dashboard
+- **Integrations** *(rolling out)* — Slack alerts, Jira/Linear decision linking, Confluence/Notion doc sync, PagerDuty escalation
 
 [Get in touch →](https://www.repowise.dev/#contact) · [hello@repowise.dev](mailto:hello@repowise.dev)
 
@@ -543,11 +589,11 @@ repowise reindex                  # rebuild vector store (no LLM calls)
 
 | Tier | Languages | What works |
 |------|-----------|------------|
-| **Full** | Python · TypeScript · JavaScript · Java · Go · Rust · C++ | AST parsing, import resolution, named bindings, call resolution, heritage extraction, docstrings |
-| **Good** | C · Kotlin · Ruby · C# · Swift · Scala · PHP | AST parsing, import resolution, named bindings, call resolution, heritage (mixins, derive, extensions, traits), docstrings, dedicated resolvers |
+| **Full** | Python · TypeScript · JavaScript · Java · Go · Rust · C++ · C# | AST parsing, import resolution, named bindings, call resolution, heritage extraction, docstrings; multi-project workspace resolvers (`.csproj`/`.sln` for C#, `Cargo.toml [workspace]` for Rust, `go.mod` multi-module, `package.json` workspaces, etc.); framework-aware edges (Django, FastAPI, Flask, ASP.NET, Spring Boot, Express/NestJS, Gin/Echo/Chi, Axum/Actix); per-language dynamic-hint extractors for runtime-resolved DI / reflection / plugins |
+| **Good** | C · Kotlin · Ruby · Swift · Scala · PHP | AST parsing, import resolution, named bindings, call resolution, heritage (mixins, derive, extensions, traits), docstrings, dedicated workspace-aware resolvers (Gradle subprojects, Rails / Zeitwerk, SPM, SBT/Mill, composer PSR-4); Rails / Laravel / TYPO3 framework edges for Ruby and PHP; per-language dynamic-hint extractors |
 | **Config / data** | OpenAPI · Protobuf · GraphQL · Dockerfile · Makefile · YAML · JSON · TOML · SQL · Terraform | Included in the file tree; special handlers extract endpoints/targets where applicable |
 
-14 languages with full AST support. Adding a new language requires one `.scm` tree-sitter query file and one config entry. No changes to the parser core. See [Language Support](docs/LANGUAGE_SUPPORT.md) for details.
+14 languages with full AST support, 8 of them at the Full tier. Adding a new language requires one `.scm` tree-sitter query file and one config entry. No changes to the parser core. See [Language Support](docs/LANGUAGE_SUPPORT.md) for details.
 
 ---
 
@@ -568,9 +614,10 @@ repowise reindex                  # rebuild vector store (no LLM calls)
 `repowise init` generates `.repowise/config.yaml`. Key options:
 
 ```yaml
-provider: anthropic               # anthropic | openai | ollama | litellm
+provider: anthropic               # anthropic | openai | openrouter | gemini | deepseek | ollama | litellm | mock
 model: claude-sonnet-4-5
 embedding_model: voyage-3
+reasoning: auto                   # auto | off | minimal
 
 git:
   co_change_commit_limit: 500
@@ -585,6 +632,10 @@ maintenance:
   background_regen_schedule: "0 2 * * *"
 ```
 
+`reasoning` applies to documentation generation. `auto` preserves provider
+defaults; explicit `off` / `minimal` modes are translated only by providers and
+models that support them, otherwise repowise fails before making an API call.
+
 Full configuration reference: [docs/CONFIG.md](docs/CONFIG.md)
 
 ---
@@ -594,8 +645,22 @@ Full configuration reference: [docs/CONFIG.md](docs/CONFIG.md)
 ```bash
 git clone https://github.com/repowise-dev/repowise
 cd repowise
-pip install -e "packages/core[dev]"
-pytest tests/unit/
+uv sync --all-packages
+uv run repowise --version
+uv run pytest tests/unit/
+```
+
+Run commands through uv without activating the environment:
+
+```bash
+uv run repowise --help
+```
+
+Or activate the local environment created by `uv sync`:
+
+```bash
+source .venv/bin/activate
+repowise --help
 ```
 
 Full guide including how to add languages and LLM providers: [CONTRIBUTING.md](CONTRIBUTING.md)
@@ -614,6 +679,6 @@ For commercial licensing — embedding repowise in a product, white-labeling, or
 
 Built for engineers who got tired of watching their AI agent `cat` the same file for the fourth time.
 
-[repowise.dev](https://repowise.dev) · [Live Demo →](https://repowise.dev/examples) · [Discord](https://discord.gg/cQVpuDB6rh) · [X](https://x.com/repowisedev) · [hello@repowise.dev](mailto:hello@repowise.dev)
+[repowise.dev](https://repowise.dev) · [Explore →](https://www.repowise.dev/explore) · [Discord](https://discord.gg/cQVpuDB6rh) · [X](https://x.com/repowisedev) · [hello@repowise.dev](mailto:hello@repowise.dev)
 
 </div>

@@ -26,6 +26,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from functools import lru_cache
 from pathlib import Path
 
 import structlog
@@ -42,6 +43,8 @@ from .extractors import (
     refine_go_type_kind,
     refine_kotlin_class_kind,
 )
+from .extractors.bindings.python import expand_bare_relative_imports
+from .extractors.synthetic_symbols import extract_synthetic_symbols
 from .extractors.visibility import (
     csharp_visibility,
     go_visibility,
@@ -50,6 +53,7 @@ from .extractors.visibility import (
     php_visibility,
     public_by_default,
     py_visibility,
+    refine_cpp_visibility,
     rust_visibility,
     scala_visibility,
     swift_visibility,
@@ -62,11 +66,57 @@ from .models import (
     Import,
     ParsedFile,
     Symbol,
+    TypeReference,
 )
 
 log = structlog.get_logger(__name__)
 
+# Any single file emitting more than this many symbols is almost
+# certainly machine-generated (large gRPC service contracts, OpenAPI
+# bindings, SQL schema bindings). Warn rather than truncate — operators
+# can decide whether to add the file to ``_NEVER_FLAG_PATTERNS`` or to
+# exclude it via traversal.
+_SYMBOL_COUNT_WARN_THRESHOLD = 500
+
 QUERIES_DIR = Path(__file__).parent / "queries"
+
+
+@lru_cache(maxsize=None)
+def _load_compiled_query(lang: str, grammar_tag: str | None = None) -> object | None:
+    """Process-wide cache of compiled tree-sitter Query objects.
+
+    Compiling `.scm` queries is non-trivial; in process-pool parsing each worker
+    would otherwise recompile per file. ``grammar_tag`` may differ from
+    ``lang`` when a language reuses another's grammar at a different
+    variant — e.g. ``.tsx`` files reuse ``typescript.scm`` but must bind
+    to the JSX-aware ``tsx`` grammar so React components don't drown in
+    ERROR nodes.
+    """
+    grammar = grammar_tag or lang
+    language = _get_language(grammar)
+    if language is None:
+        return None
+
+    scm_path = QUERIES_DIR / f"{lang}.scm"
+    if not scm_path.exists():
+        log.debug("No .scm query file found", language=lang, path=str(scm_path))
+        return None
+
+    scm_text = scm_path.read_text(encoding="utf-8")
+    # Grammar-variant-specific additions (e.g. JSX node captures that are
+    # only valid against the ``tsx`` grammar but not the plain ``typescript``
+    # one). Appended to the base SCM only when the variant scm file exists.
+    if grammar_tag and grammar_tag != lang:
+        extra_scm = QUERIES_DIR / f"{grammar_tag}.scm"
+        if extra_scm.exists():
+            scm_text = scm_text + "\n" + extra_scm.read_text(encoding="utf-8")
+    try:
+        from tree_sitter import Query  # type: ignore[attr-defined]
+
+        return Query(language, scm_text)
+    except Exception as exc:
+        log.warning("Failed to compile query", language=lang, error=str(exc))
+        return None
 
 # Languages that intentionally have no AST parser.  Derived from the
 # centralised LanguageRegistry — only non-code passthrough languages are
@@ -269,6 +319,7 @@ LANGUAGE_CONFIGS: dict[str, LanguageConfig] = {
             "class_declaration": "class",
             "interface_declaration": "interface",
             "enum_declaration": "enum",
+            "record_declaration": "class",  # Java 16+ records
             "method_declaration": "method",
             "constructor_declaration": "function",
         },
@@ -277,7 +328,7 @@ LANGUAGE_CONFIGS: dict[str, LanguageConfig] = {
         visibility_fn=java_visibility,
         parent_extraction="nesting",
         parent_class_types=frozenset(
-            {"class_declaration", "interface_declaration", "enum_declaration"}
+            {"class_declaration", "interface_declaration", "enum_declaration", "record_declaration"}
         ),
         entry_point_patterns=["Main.java", "Application.java"],
     ),
@@ -323,6 +374,8 @@ LANGUAGE_CONFIGS: dict[str, LanguageConfig] = {
             "function_declaration": "function",
             "class_declaration": "class",
             "object_declaration": "class",
+            "type_alias": "type_alias",
+            "property_declaration": "variable",
         },
         import_node_types=["import"],
         export_node_types=[],
@@ -337,6 +390,7 @@ LANGUAGE_CONFIGS: dict[str, LanguageConfig] = {
             "singleton_method": "function",
             "class": "class",
             "module": "module",
+            "assignment": "constant",
         },
         import_node_types=["call"],
         export_node_types=[],
@@ -351,16 +405,32 @@ LANGUAGE_CONFIGS: dict[str, LanguageConfig] = {
             "interface_declaration": "interface",
             "struct_declaration": "struct",
             "enum_declaration": "enum",
+            "enum_member_declaration": "variable",
             "method_declaration": "method",
             "constructor_declaration": "function",
             "property_declaration": "variable",
+            "field_declaration": "variable",
+            "record_declaration": "class",
+            "delegate_declaration": "function",
+            "event_declaration": "variable",
+            "event_field_declaration": "variable",
+            "namespace_declaration": "module",
+            "file_scoped_namespace_declaration": "module",
         },
-        import_node_types=["using_directive"],
+        import_node_types=["using_directive", "global_using_directive"],
         export_node_types=[],
         visibility_fn=csharp_visibility,
         parent_extraction="nesting",
         parent_class_types=frozenset(
-            {"class_declaration", "interface_declaration", "struct_declaration", "enum_declaration"}
+            {
+                "class_declaration",
+                "interface_declaration",
+                "struct_declaration",
+                "enum_declaration",
+                "record_declaration",
+                "namespace_declaration",
+                "file_scoped_namespace_declaration",
+            }
         ),
         entry_point_patterns=["Program.cs", "Startup.cs"],
     ),
@@ -371,6 +441,7 @@ LANGUAGE_CONFIGS: dict[str, LanguageConfig] = {
             "function_declaration": "function",
             "protocol_function_declaration": "function",
             "property_declaration": "variable",
+            "subscript_declaration": "method",
         },
         import_node_types=["import_declaration"],
         export_node_types=[],
@@ -387,6 +458,9 @@ LANGUAGE_CONFIGS: dict[str, LanguageConfig] = {
             "function_definition": "function",
             "function_declaration": "function",
             "val_definition": "variable",
+            "var_definition": "variable",
+            "enum_definition": "enum",
+            "given_definition": "variable",
         },
         import_node_types=["import_declaration"],
         export_node_types=[],
@@ -403,6 +477,8 @@ LANGUAGE_CONFIGS: dict[str, LanguageConfig] = {
             "enum_declaration": "enum",
             "method_declaration": "method",
             "function_definition": "function",
+            "const_declaration": "constant",
+            "property_declaration": "variable",
         },
         import_node_types=["namespace_use_declaration"],
         export_node_types=[],
@@ -412,6 +488,18 @@ LANGUAGE_CONFIGS: dict[str, LanguageConfig] = {
             {"class_declaration", "interface_declaration", "trait_declaration", "enum_declaration"}
         ),
         entry_point_patterns=["index.php", "public/index.php"],
+    ),
+    "luau": LanguageConfig(
+        symbol_node_types={
+            "function_declaration": "function",
+            "type_definition": "type_alias",
+        },
+        import_node_types=["function_call"],
+        export_node_types=[],
+        visibility_fn=public_by_default,
+        parent_extraction="none",
+        parent_class_types=frozenset(),
+        entry_point_patterns=["init.luau", "init.lua"],
     ),
 }
 
@@ -436,14 +524,18 @@ class ASTParser:
     """
 
     def __init__(self) -> None:
-        # Cache: lang → compiled Query object (None if .scm not found)
-        self._query_cache: dict[str, object] = {}
+        pass
 
     def parse_file(self, file_info: FileInfo, source: bytes) -> ParsedFile:
         """Parse *source* bytes and return a fully populated ParsedFile."""
         lang = file_info.language
         config = LANGUAGE_CONFIGS.get(lang)
-        language = _get_language(lang)
+        # .tsx files need the JSX-aware grammar; tree-sitter-typescript's
+        # default `language_typescript` errors out on every `<Component />`
+        # and the resulting ERROR-node recovery hoists nested helpers
+        # (handlers defined inside component bodies) to the top level.
+        grammar_tag = "tsx" if lang == "typescript" and file_info.path.endswith(".tsx") else lang
+        language = _get_language(grammar_tag)
 
         if config is None or language is None:
             if config is not None and language is None:
@@ -473,14 +565,32 @@ class ASTParser:
         root = tree.root_node
 
         parse_errors = _collect_error_nodes(root)
-        query = self._get_query(lang, language)
+        query = self._get_query(lang, language, grammar_tag)
 
         symbols = self._extract_symbols(tree, query, config, file_info, src)
+        # Per-language synthetic-symbol pass — recognises source-generator
+        # attributes (e.g. CommunityToolkit.Mvvm) and adds the symbols the
+        # generator would emit at compile time. No-op for languages
+        # without a registered extractor.
+        synthetic = extract_synthetic_symbols(root, src, file_info)
+        if synthetic:
+            existing_ids = {s.id for s in symbols}
+            symbols.extend(s for s in synthetic if s.id not in existing_ids)
         imports = self._extract_imports(tree, query, config, file_info, src)
         calls = self._extract_calls(tree, query, config, file_info, src, symbols)
         heritage = extract_heritage(tree, query, config, file_info, src, run_query=_run_query)
         exports = self._derive_exports(symbols, config, src)
         docstring = extract_module_docstring(root, src, lang)
+        type_refs = self._extract_type_refs(tree, query, src)
+
+        if len(symbols) > _SYMBOL_COUNT_WARN_THRESHOLD:
+            log.warning(
+                "parser.symbol_bloat",
+                path=file_info.path,
+                language=lang,
+                symbol_count=len(symbols),
+                threshold=_SYMBOL_COUNT_WARN_THRESHOLD,
+            )
 
         return ParsedFile(
             file_info=file_info,
@@ -491,37 +601,16 @@ class ASTParser:
             heritage=heritage,
             docstring=docstring,
             parse_errors=parse_errors,
+            type_refs=type_refs,
         )
 
     # ------------------------------------------------------------------
     # Query loading
     # ------------------------------------------------------------------
 
-    def _get_query(self, lang: str, language: Language) -> object | None:
+    def _get_query(self, lang: str, language: Language, grammar_tag: str | None = None) -> object | None:
         """Load and cache the compiled tree-sitter Query for *lang*."""
-        if lang in self._query_cache:
-            return self._query_cache[lang]
-
-        scm_lang = lang
-        scm_path = QUERIES_DIR / f"{scm_lang}.scm"
-
-        if not scm_path.exists():
-            log.debug("No .scm query file found", language=lang, path=str(scm_path))
-            self._query_cache[lang] = None
-            return None
-
-        scm_text = scm_path.read_text(encoding="utf-8")
-        try:
-            from tree_sitter import Query  # type: ignore[attr-defined]
-
-            compiled = Query(language, scm_text)
-            self._query_cache[lang] = compiled
-            log.debug("Compiled query", language=lang)
-            return compiled
-        except Exception as exc:
-            log.warning("Failed to compile query", language=lang, error=str(exc))
-            self._query_cache[lang] = None
-            return None
+        return _load_compiled_query(lang, grammar_tag)
 
     # ------------------------------------------------------------------
     # Symbol extraction
@@ -568,6 +657,17 @@ class ASTParser:
             if kind is None:
                 continue
 
+            # Skip symbols nested inside another function/method body. The
+            # Tree-sitter query is recursive, so helpers defined inside a
+            # React component or an async orchestrator method get hoisted
+            # to the top-level symbol list and read as unused public
+            # exports. Filtering by callable ancestor restricts extraction
+            # to module-top-level + class-body members. Class bodies don't
+            # match (``class_definition`` is not callable), so methods are
+            # preserved.
+            if _has_callable_ancestor(def_node, config.symbol_node_types):
+                continue
+
             # Refine "struct" kind for Go type_spec (check if struct or interface body)
             if kind == "struct" and config.parent_extraction == "receiver":
                 kind = refine_go_type_kind(def_node, src)
@@ -586,9 +686,29 @@ class ASTParser:
                     if sibling.type == "decorator":
                         modifier_texts.append(_node_text(sibling, src))
             visibility = config.visibility_fn(name, modifier_texts)
+            is_exported_symbol = False
+            # C/C++ visibility is dictated by AST context (access
+            # specifiers / storage class / export attributes), not by
+            # modifier text. Refine after the generic fn ran.
+            if file_info.language in ("cpp", "c"):
+                visibility, is_exported_symbol = refine_cpp_visibility(
+                    def_node, visibility, src
+                )
 
             # Parent class detection
             parent_name = self._find_parent(def_node, config, receiver_nodes, src)
+
+            # C/C++ qualified definitions: ``void Foo::method() { … }``
+            # carries the class as the scope of a ``qualified_identifier``
+            # parent of the name node. Without this resolution, every
+            # ``Class::method`` lands as a free function and bloats the
+            # unused_export pass with thousands of method symbols.
+            if (
+                parent_name is None
+                and file_info.language in ("cpp", "c")
+                and name_nodes
+            ):
+                parent_name = _qualified_cpp_parent(name_nodes[0], src)
 
             # Upgrade function → method when a parent class is detected
             if parent_name and kind == "function":
@@ -625,6 +745,7 @@ class ASTParser:
                     is_async=is_async,
                     language=file_info.language,
                     parent_name=parent_name,
+                    is_exported_symbol=is_exported_symbol,
                 )
             )
 
@@ -708,6 +829,9 @@ class ASTParser:
                     bindings=bindings,
                 )
             )
+
+        if file_info.language == "python":
+            imports = expand_bare_relative_imports(imports)
 
         return imports
 
@@ -799,6 +923,53 @@ class ASTParser:
             return [s.name for s in symbols if s.visibility == "public" and s.parent_name is None]
         return [s.name for s in symbols if s.visibility == "public" and s.parent_name is None]
 
+    # ------------------------------------------------------------------
+    # Type reference extraction (non-import positions)
+    # ------------------------------------------------------------------
+
+    def _extract_type_refs(
+        self,
+        tree: object,
+        query: object,
+        src: str,
+    ) -> list[TypeReference]:
+        """Collect ``@param.type`` captures into TypeReference records.
+
+        Currently only the C# query emits these captures (constructor /
+        method / delegate / primary-ctor parameter types). The graph
+        builder resolves each reference to a defining file via the
+        language-specific resolver index and emits a file-level edge.
+
+        Capture origin is inferred from the parameter's enclosing node:
+        ``constructor_declaration`` → ``ctor_param`` (highest signal:
+        canonical DI vector), ``method_declaration`` → ``method_param``,
+        ``delegate_declaration`` → ``delegate_param``. Primary
+        constructors on records / classes also resolve to ``ctor_param``.
+        """
+        if query is None:
+            return []
+
+        refs: list[TypeReference] = []
+        seen: set[tuple[str, int]] = set()
+
+        for capture_dict in _run_query(query, tree.root_node):  # type: ignore[attr-defined]
+            type_nodes = capture_dict.get("param.type", [])
+            if not type_nodes:
+                continue
+            for type_node in type_nodes:
+                head = _head_type_identifier(type_node, src)
+                if not head:
+                    continue
+                line = type_node.start_point[0] + 1
+                key = (head, line)
+                if key in seen:
+                    continue
+                seen.add(key)
+                origin = _classify_param_origin(type_node)
+                refs.append(TypeReference(type_name=head, line=line, origin=origin))
+
+        return refs
+
 
 # ---------------------------------------------------------------------------
 # Convenience function
@@ -862,11 +1033,189 @@ def _is_async_node(node: Node, src: str) -> bool:
     return node.type == "async_function_definition" or any(c.type == "async" for c in node.children)
 
 
+_CALLABLE_KINDS: frozenset[str] = frozenset({"function", "method"})
+
+
+def _has_callable_ancestor(node: Node, symbol_kinds: dict[str, str]) -> bool:
+    """True if ``node`` has any function/method ancestor in the AST.
+
+    Used to filter out helpers defined inside another function's body
+    (React event handlers, async-method-local coroutines, JS closures)
+    from the top-level symbol list. Class bodies don't count — methods
+    inside classes have only a ``class`` ancestor before the module root.
+    """
+    ancestor = node.parent
+    while ancestor is not None:
+        if symbol_kinds.get(ancestor.type) in _CALLABLE_KINDS:
+            return True
+        ancestor = ancestor.parent
+    return False
+
+
+def _qualified_cpp_parent(name_node: Node, src: str) -> str | None:
+    """Return the parent class for a C/C++ ``Class::method`` definition.
+
+    The captured ``@symbol.name`` for a qualified function definition
+    is the bare ``method`` identifier whose parent is a
+    ``qualified_identifier`` carrying the class / namespace as its
+    ``scope`` field. For multi-level qualifications (``NS::Foo::method``)
+    the relevant parent is still the innermost qualifier — namespaces
+    above it are not the symbol's containing type. Tree-sitter-cpp
+    represents this by nesting ``qualified_identifier`` left-recursively,
+    so the immediate parent's ``scope`` is always the right answer.
+
+    Returns ``None`` when the name node is not inside a qualified
+    identifier (i.e. plain free function).
+    """
+    parent = name_node.parent
+    if parent is None or parent.type != "qualified_identifier":
+        return None
+    scope = parent.child_by_field_name("scope")
+    if scope is None:
+        return None
+    text = src[scope.start_byte : scope.end_byte].strip()
+    # ``scope`` may itself be a qualified path (``NS::Foo``); take the
+    # last component — that's the immediate enclosing type.
+    return text.rsplit("::", 1)[-1] or None
+
+
 def _build_qualified_name(file_path: str, parent_name: str | None, name: str) -> str:
     module = Path(file_path).with_suffix("").as_posix().replace("/", ".")
     if parent_name:
         return f"{module}.{parent_name}.{name}"
     return f"{module}.{name}"
+
+
+# ---------------------------------------------------------------------------
+# Type reference helpers (used by _extract_type_refs)
+# ---------------------------------------------------------------------------
+
+# Type expressions that never resolve to a user-defined .NET type. Skipping
+# these here avoids polluting the resolver with hopeless lookups. Generic
+# args inside `IList<T>` are stripped before this check is applied.
+_BUILTIN_CSHARP_TYPES: frozenset[str] = frozenset({
+    "void", "bool", "byte", "sbyte", "char", "short", "ushort", "int",
+    "uint", "long", "ulong", "float", "double", "decimal", "string",
+    "object", "nint", "nuint", "dynamic", "var",
+    # Frequently appearing BCL types that are always external — listing
+    # them here is purely a performance optimisation (one dict miss
+    # avoided per occurrence).
+    "Task", "ValueTask", "CancellationToken", "Action", "Func",
+    "Type", "Exception", "DateTime", "DateTimeOffset", "TimeSpan",
+    "Guid", "Uri", "Stream",
+})
+
+_PARAM_ORIGIN_BY_ANCESTOR: dict[str, str] = {
+    "constructor_declaration": "ctor_param",
+    "method_declaration": "method_param",
+    "delegate_declaration": "delegate_param",
+    "record_declaration": "ctor_param",
+    "class_declaration": "ctor_param",
+    "struct_declaration": "ctor_param",
+}
+
+
+def _head_type_identifier(type_node: Node, src: str) -> str | None:
+    """Return the head identifier of a C# type expression, or None.
+
+    Examples:
+        ``IBasketService``                  → "IBasketService"
+        ``IList<Basket>``                   → "IList"
+        ``Acme.Catalog.IRepository<T>``     → "IRepository"
+        ``ref readonly Span<byte>``         → "Span"
+        ``string``                          → None (built-in)
+        ``int?``                            → None
+        ``T``                               → None (likely a generic param)
+
+    The point of returning the head identifier is that the
+    DotNetProjectIndex type-name lookup is keyed by unqualified type
+    name. Generic-arg recursion is intentionally NOT done here — each
+    generic arg is captured in its own ``@param.type`` if it's a real
+    parameter type, and the resolver doesn't currently track generic
+    instantiation graphs.
+    """
+    head_node: Node | None = type_node
+
+    # Unwrap modifier wrappers: nullable_type, ref_type, pointer_type,
+    # array_type, tuple_type. tree-sitter-c-sharp puts the inner type
+    # at field "type" or as the first non-trivia child.
+    for _ in range(6):
+        if head_node is None:
+            return None
+        if head_node.type in ("nullable_type", "ref_type", "pointer_type", "array_type"):
+            inner = head_node.child_by_field_name("type")
+            if inner is None:
+                # Fall back to first identifier-bearing child
+                inner = next(
+                    (c for c in head_node.children if c.type not in (",", "?", "*", "&", "ref", "out", "in", "[", "]")),
+                    None,
+                )
+            head_node = inner
+            continue
+        break
+
+    if head_node is None:
+        return None
+
+    if head_node.type == "identifier":
+        text = _node_text(head_node, src)
+    elif head_node.type == "predefined_type":
+        text = _node_text(head_node, src)
+    elif head_node.type == "generic_name":
+        name_child = head_node.child_by_field_name("name") or next(
+            (c for c in head_node.children if c.type == "identifier"), None,
+        )
+        text = _node_text(name_child, src) if name_child else ""
+    elif head_node.type == "qualified_name":
+        # `Foo.Bar.Baz` — take the rightmost identifier
+        idents = [c for c in head_node.children if c.type == "identifier"]
+        text = _node_text(idents[-1], src) if idents else ""
+    elif head_node.type == "tuple_type":
+        return None  # Tuple elements aren't single types
+    else:
+        # Unknown shape — fall back to first identifier in the subtree
+        ident = _first_descendant(head_node, "identifier")
+        text = _node_text(ident, src) if ident else ""
+
+    if not text or not text[0].isalpha() and text[0] != "_":
+        return None
+    if text in _BUILTIN_CSHARP_TYPES:
+        return None
+    # Single-uppercase-letter heads are overwhelmingly generic params (T, K, V).
+    # Skipping them avoids spurious lookups against a type-name index that
+    # would never contain them.
+    if len(text) == 1 and text.isupper():
+        return None
+    return text
+
+
+def _first_descendant(node: Node, type_name: str) -> Node | None:
+    stack = [node]
+    while stack:
+        current = stack.pop()
+        if current.type == type_name:
+            return current
+        stack.extend(current.children)
+    return None
+
+
+def _classify_param_origin(type_node: Node) -> str:
+    """Walk up to find the enclosing declaration and map to an origin tag.
+
+    The walk stops at the first matching ancestor or after a small depth
+    cap. Falling off the cap means the capture was outside a recognised
+    declaration shape (shouldn't happen given the query patterns, but
+    guards against grammar drift); we tag those ``method_param``.
+    """
+    cur: Node | None = type_node
+    for _ in range(8):
+        if cur is None:
+            break
+        origin = _PARAM_ORIGIN_BY_ANCESTOR.get(cur.type)
+        if origin is not None:
+            return origin
+        cur = cur.parent
+    return "method_param"
 
 
 # ---------------------------------------------------------------------------

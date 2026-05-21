@@ -21,11 +21,15 @@ from .crud import (
     batch_upsert_graph_nodes,
     batch_upsert_symbols,
     bulk_upsert_decisions,
+    bulk_upsert_external_systems,
+    link_graph_nodes_to_external_systems,
+    list_external_systems,
     count_chat_messages,
     create_chat_message,
     create_conversation,
     delete_conversation,
     delete_decision,
+    delete_repository,
     get_all_file_metrics,
     get_all_git_metadata,
     get_community_members,
@@ -52,7 +56,9 @@ from .crud import (
     list_chat_messages,
     list_conversations,
     list_decisions,
+    list_page_ids,
     list_pages,
+    load_prior_pages,
     mark_webhook_processed,
     recompute_decision_staleness,
     save_dead_code_findings,
@@ -89,6 +95,7 @@ from .models import (
     Conversation,
     DeadCodeFinding,
     DecisionRecord,
+    ExternalSystem,
     GenerationJob,
     GitMetadata,
     GraphEdge,
@@ -119,6 +126,7 @@ __all__ = [
     "DecisionRecord",
     # embedder
     "Embedder",
+    "ExternalSystem",
     # search
     "FullTextSearch",
     "GenerationJob",
@@ -144,6 +152,10 @@ __all__ = [
     "batch_upsert_symbols",
     # decision crud
     "bulk_upsert_decisions",
+    # external systems crud (C4 L1)
+    "bulk_upsert_external_systems",
+    "link_graph_nodes_to_external_systems",
+    "list_external_systems",
     # chat crud
     "count_chat_messages",
     # graph read-side queries
@@ -161,6 +173,7 @@ __all__ = [
     "create_session_factory",
     "delete_conversation",
     "delete_decision",
+    "delete_repository",
     # git metadata crud
     "get_all_git_metadata",
     "get_configured_db_url",
@@ -186,7 +199,9 @@ __all__ = [
     "list_chat_messages",
     "list_conversations",
     "list_decisions",
+    "list_page_ids",
     "list_pages",
+    "load_prior_pages",
     "mark_webhook_processed",
     "recompute_decision_staleness",
     "resolve_db_url",

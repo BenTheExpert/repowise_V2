@@ -8,10 +8,8 @@ import json
 import re
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
-
-from sqlalchemy import text
 
 from repowise.core.persistence.database import get_session
 from repowise.core.persistence.models import (
@@ -27,6 +25,7 @@ from repowise.server.mcp_server._helpers import (
     _resolve_repo_context,
     _unsupported_repo_all,
 )
+from repowise.server.mcp_server._meta import build_meta as _build_meta
 from repowise.server.mcp_server._server import mcp
 
 _FIX_PATTERN = re.compile(
@@ -186,7 +185,7 @@ async def _get_security_signals(
             {"kind": r[0], "severity": r[1], "snippet": r[2]}
             for r in rows.all()
         ]
-    except Exception:  # noqa: BLE001 — table may not exist pre-migration
+    except Exception:
         return []
 
 
@@ -349,31 +348,27 @@ async def get_risk(
     repo: str | None = None,
     changed_files: list[str] | None = None,
 ) -> dict:
-    """Assess modification risk for one or more files before making changes.
+    """What history says about touching these files — hotspot, churn, owners, blast radius.
 
-    Pass ALL files you plan to modify in a single call. Returns per-file:
-    - hotspot_score and trend ("increasing"/"stable"/"decreasing")
-    - risk_type ("churn-heavy"/"bug-prone"/"high-coupling"/"stable")
-    - impact_surface: top 3 critical modules that would break
-    - dependents, co-change partners, ownership
-    - test_gap: bool — True if no test file exists for this file
-    - security_signals: list of {kind, severity, snippet} from static analysis
+    The only tool that fuses git temporal signals (churn percentile, trend,
+    bus factor) with graph topology (dependents, co-changes, impact surface)
+    and security findings into one decision-shaped payload. Consult before
+    editing any file in the 95th+ churn percentile or before merging a
+    multi-file PR.
 
-    In workspace mode, includes cross-repo impact: co-change partners from
-    other repos, affected repos, and API contract links (files in other repos
-    that consume HTTP/gRPC/topic contracts provided by this file, or providers
-    this file depends on). Cross-repo consumers increase the dependents count.
+    Per-file fields: ``hotspot_score``, ``trend``, ``risk_type``,
+    ``impact_surface`` (top 3), ``dependents_count``, ``co_change_partners``,
+    ``primary_owner``, ``bus_factor``, ``test_gap``, ``security_signals``.
 
-    Plus the top 5 global hotspots for ambient awareness.
+    Pass ``changed_files`` for PR-blast-radius mode. The response then carries
+    a ``directive`` block — three short lists the caller can read in one
+    glance (``will_break``, ``missing_cochanges``, ``missing_tests``) — plus
+    the trimmed full ``pr_blast_radius`` dossier for deeper review. Global
+    hotspots are omitted in PR mode (irrelevant to the diff) and re-included
+    when ``changed_files`` is absent.
 
-    Pass ``changed_files`` for PR review / blast radius analysis. When provided,
-    the response includes an additional ``pr_blast_radius`` key containing:
-    - direct_risks: per-file risk score (centrality × temporal hotspot)
-    - transitive_affected: files that import any changed file (up to depth 3)
-    - cochange_warnings: historical co-change partners missing from the PR
-    - recommended_reviewers: top 5 owners of affected files
-    - test_gaps: changed/affected files lacking a corresponding test
-    - overall_risk_score: 0-10 composite score
+    In workspace mode, cross-repo consumers and API contract links bump the
+    dependents count and appear in ``cross_repo_impact``.
 
     Example: get_risk(["src/auth/service.py"], changed_files=["src/auth/service.py"])
 
@@ -524,10 +519,127 @@ async def get_risk(
                 f"{r['dependents_count']} dependents",
             )
 
+    # ---- Code-health enrichment --------------------------------------------
+    # Attach per-file health_score + top_biomarkers (up to 3) drawn from the
+    # health tables. Conservative: missing data → no field, never invented.
+    try:
+        from repowise.core.persistence.models import HealthFileMetric, HealthFinding
+
+        target_paths = [r["target"] for r in results if r.get("target")]
+        if target_paths:
+            async with get_session(ctx.session_factory) as _h_session:
+                m_res = await _h_session.execute(
+                    select(HealthFileMetric).where(
+                        HealthFileMetric.repository_id == repo_id,
+                        HealthFileMetric.file_path.in_(target_paths),
+                    )
+                )
+                metric_map = {m.file_path: m for m in m_res.scalars().all()}
+
+                f_res = await _h_session.execute(
+                    select(HealthFinding)
+                    .where(
+                        HealthFinding.repository_id == repo_id,
+                        HealthFinding.file_path.in_(target_paths),
+                        HealthFinding.status == "open",
+                    )
+                    .order_by(HealthFinding.health_impact.desc())
+                )
+                top_by_file: dict[str, list[dict]] = {}
+                for f in f_res.scalars().all():
+                    lst = top_by_file.setdefault(f.file_path, [])
+                    if len(lst) >= 3:
+                        continue
+                    lst.append({
+                        "biomarker_type": f.biomarker_type,
+                        "severity": f.severity,
+                        "function_name": f.function_name,
+                        "impact": round(f.health_impact, 2),
+                    })
+
+            for r in results:
+                path = r.get("target")
+                m = metric_map.get(path)
+                if m is not None:
+                    r["health_score"] = round(m.score, 2)
+                    if m.line_coverage_pct is not None:
+                        r["coverage_pct"] = round(m.line_coverage_pct, 2)
+                    if m.branch_coverage_pct is not None:
+                        r["branch_coverage_pct"] = round(m.branch_coverage_pct, 2)
+                if path in top_by_file:
+                    r["top_biomarkers"] = top_by_file[path]
+    except Exception:
+        pass
+
     response: dict = {
         "targets": {r["target"]: r for r in results},
-        "global_hotspots": global_hotspots,
     }
+
     if pr_blast_radius is not None:
-        response["pr_blast_radius"] = pr_blast_radius
+        # PR mode — drop global_hotspots (irrelevant to a specific diff), trim
+        # per-target co-change lists, and synthesize a tight directive the
+        # agent can act on without parsing the whole blast-radius dossier.
+        for r in response["targets"].values():
+            partners = r.get("co_change_partners") or []
+            if len(partners) > 3:
+                r["co_change_partners"] = partners[:3]
+
+        # ``pr_blast_radius`` is the analyzer's own payload — preserve it for
+        # callers that want the full picture, but truncate the noisy lists so
+        # we stay well under the 25k-token transport ceiling on PRs that touch
+        # many files. The directive below is what the agent should read first.
+        trimmed_blast: dict[str, Any] = dict(pr_blast_radius)
+        for key, cap in (
+            ("transitive_affected", 15),
+            ("cochange_warnings", 10),
+            ("test_gaps", 10),
+            ("recommended_reviewers", 5),
+        ):
+            value = trimmed_blast.get(key)
+            if isinstance(value, list) and len(value) > cap:
+                trimmed_blast[key] = value[:cap]
+                trimmed_blast[f"{key}_truncated_total"] = len(value)
+        response["pr_blast_radius"] = trimmed_blast
+
+        # Directive: 3 short lists the agent can read in one glance. Each
+        # entry is a file path (string), never a dossier. Designed to answer
+        # "what should I do about this PR" in three lines.
+        def _as_path(entry: Any) -> str | None:
+            if isinstance(entry, str):
+                return entry
+            if isinstance(entry, dict):
+                return entry.get("file_path") or entry.get("path") or entry.get("file")
+            return None
+
+        will_break = [
+            p for p in (_as_path(e) for e in trimmed_blast.get("transitive_affected", []))
+            if p
+        ][:5]
+        missing_cochanges = [
+            p for p in (_as_path(e) for e in trimmed_blast.get("cochange_warnings", []))
+            if p
+        ][:3]
+        missing_tests = [
+            p for p in (_as_path(e) for e in trimmed_blast.get("test_gaps", []))
+            if p
+        ][:3]
+
+        response["directive"] = {
+            "will_break": will_break,
+            "missing_cochanges": missing_cochanges,
+            "missing_tests": missing_tests,
+            "overall_risk_score": trimmed_blast.get("overall_risk_score"),
+            "summary": (
+                f"PR touches {len(changed_files)} file(s). "
+                f"~{len(will_break)} downstream file(s) likely affected, "
+                f"{len(missing_cochanges)} historical co-changer(s) missing, "
+                f"{len(missing_tests)} file(s) without tests."
+            ),
+        }
+    else:
+        # Standard per-file risk request (no diff) — keep global hotspots as
+        # ambient awareness. Cheap (≤5 entries) and useful for orientation.
+        response["global_hotspots"] = global_hotspots
+
+    response["_meta"] = _build_meta(repository=repository)
     return response

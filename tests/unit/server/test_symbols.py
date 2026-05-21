@@ -40,7 +40,10 @@ async def test_search_symbols_empty(client: AsyncClient) -> None:
     repo = await create_test_repo(client)
     resp = await client.get("/api/symbols", params={"repo_id": repo["id"]})
     assert resp.status_code == 200
-    assert resp.json() == []
+    payload = resp.json()
+    assert payload["total"] == 0
+    assert payload["items"] == []
+    assert payload["has_more"] is False
 
 
 @pytest.mark.asyncio
@@ -50,10 +53,15 @@ async def test_search_symbols_by_name(client: AsyncClient, app) -> None:
 
     resp = await client.get("/api/symbols", params={"repo_id": repo["id"], "q": "main"})
     assert resp.status_code == 200
-    data = resp.json()
+    payload = resp.json()
+    assert payload["total"] == 1
+    data = payload["items"]
     assert len(data) == 1
     assert data[0]["name"] == "main"
     assert data[0]["kind"] == "function"
+    # New importance enrichment fields should be populated.
+    assert data[0]["importance_score"] is not None
+    assert data[0]["importance_components"] is not None
 
 
 @pytest.mark.asyncio
@@ -69,9 +77,39 @@ async def test_search_symbols_by_kind(client: AsyncClient, app) -> None:
 
     resp = await client.get("/api/symbols", params={"repo_id": repo["id"], "kind": "class"})
     assert resp.status_code == 200
-    data = resp.json()
+    data = resp.json()["items"]
     assert len(data) == 1
     assert data[0]["kind"] == "class"
+
+
+@pytest.mark.asyncio
+async def test_search_symbols_by_file_path(client: AsyncClient, app) -> None:
+    """The ``file_path`` filter scopes results to a single source file —
+    powers the hotspot-row → top-symbols drill-down."""
+    repo = await create_test_repo(client)
+    await _insert_symbol(
+        app.state.session_factory,
+        repo["id"],
+        name="alpha",
+        symbol_id="src/a.py::alpha",
+        file_path="src/a.py",
+    )
+    await _insert_symbol(
+        app.state.session_factory,
+        repo["id"],
+        name="beta",
+        symbol_id="src/b.py::beta",
+        file_path="src/b.py",
+    )
+
+    resp = await client.get(
+        "/api/symbols",
+        params={"repo_id": repo["id"], "file_path": "src/a.py"},
+    )
+    assert resp.status_code == 200
+    payload = resp.json()
+    assert payload["total"] == 1
+    assert payload["items"][0]["name"] == "alpha"
 
 
 @pytest.mark.asyncio

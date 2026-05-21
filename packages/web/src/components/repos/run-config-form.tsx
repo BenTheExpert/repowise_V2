@@ -2,17 +2,17 @@
 
 import { useEffect } from "react";
 import { config } from "@/lib/config";
-import { Label } from "@/components/ui/label";
-import { Input } from "@/components/ui/input";
-import { Switch } from "@/components/ui/switch";
-import { Slider } from "@/components/ui/slider";
+import { Label } from "@repowise-dev/ui/ui/label";
+import { Input } from "@repowise-dev/ui/ui/input";
+import { Switch } from "@repowise-dev/ui/ui/switch";
+import { Slider } from "@repowise-dev/ui/ui/slider";
 import {
   Select,
   SelectContent,
   SelectItem,
   SelectTrigger,
   SelectValue,
-} from "@/components/ui/select";
+} from "@repowise-dev/ui/ui/select";
 
 export interface RunConfig {
   provider: string;
@@ -27,7 +27,7 @@ interface Props {
   onChange: (v: RunConfig) => void;
 }
 
-const PROVIDERS = ["litellm", "openai", "anthropic", "ollama", "mock"] as const;
+const PROVIDERS = ["litellm", "openai", "anthropic", "gemini", "deepseek", "ollama", "mock"] as const;
 
 export function RunConfigForm({ value, onChange }: Props) {
   // Seed from saved settings on mount
@@ -51,9 +51,9 @@ export function RunConfigForm({ value, onChange }: Props) {
     <div className="space-y-4">
       <div className="grid grid-cols-2 gap-3">
         <div className="space-y-1.5">
-          <Label>Provider</Label>
+          <Label htmlFor="run-provider">Provider</Label>
           <Select value={value.provider} onValueChange={(v) => set("provider", v)}>
-            <SelectTrigger>
+            <SelectTrigger id="run-provider" aria-label="Provider">
               <SelectValue />
             </SelectTrigger>
             <SelectContent>
@@ -108,12 +108,15 @@ export function RunConfigForm({ value, onChange }: Props) {
 
       <div className="space-y-2">
         <div className="flex items-center justify-between">
-          <Label>Concurrency</Label>
+          <Label htmlFor="run-concurrency">Concurrency</Label>
           <span className="text-sm tabular-nums text-[var(--color-text-secondary)]">
             {value.concurrency}
           </span>
         </div>
         <Slider
+          id="run-concurrency"
+          aria-label="Concurrency"
+          aria-valuetext={`${value.concurrency} parallel`}
           min={1}
           max={10}
           step={1}

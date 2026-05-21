@@ -18,7 +18,7 @@ import asyncio
 import os
 import time
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
@@ -27,6 +27,53 @@ import structlog
 from repowise.core.pipeline.progress import ProgressCallback
 
 logger = structlog.get_logger(__name__)
+
+
+def _phase_done(progress: ProgressCallback | None, phase: str) -> None:
+    """Best-effort call to ``progress.on_phase_done`` — older callbacks may
+    not implement it, so fall back to a no-op silently.
+    """
+    if progress is None:
+        return
+    fn = getattr(progress, "on_phase_done", None)
+    if callable(fn):
+        try:
+            fn(phase)
+        except Exception:
+            pass
+
+
+async def _timed_step(
+    label: str,
+    fn: Any,
+    progress: ProgressCallback | None,
+) -> Any:
+    """Run *fn* in a worker thread and emit a per-step completion line.
+
+    Used to make ``asyncio.gather`` of multiple graph-algorithm calls
+    legible: without this, four concurrent thread-bound computations
+    (e.g. PageRank + betweenness + symbol PageRank + symbol betweenness)
+    appear in the CLI as one opaque several-minute spinner, so the user
+    has no signal as to which step is the bottleneck. With it, each algo
+    prints `  ↳ <label> ✓ (Xs)` as it finishes — completion order
+    surfaces the relative cost without changing the underlying execution.
+    """
+    t0 = time.monotonic()
+    try:
+        result = await asyncio.to_thread(fn)
+    except Exception as exc:
+        if progress is not None:
+            progress.on_message(
+                "warning",
+                f"  ↳ {label} failed after {time.monotonic() - t0:.1f}s: {exc}",
+            )
+        raise
+    if progress is not None:
+        progress.on_message(
+            "info",
+            f"  ↳ {label} ✓ ({time.monotonic() - t0:.1f}s)",
+        )
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -124,9 +171,24 @@ class PipelineResult:
     execution_flow_report: Any | None = None
     """``ExecutionFlowReport`` or None (populated after graph build)."""
 
+    health_report: Any | None = None
+    """``HealthReport`` or None — populated by ``_run_health_analysis``."""
+
     # Traversal stats
     traversal_stats: Any | None = None
     """``TraversalStats`` from the file traverser, or None."""
+
+    # Detected tech stack (languages, frameworks, databases, infra).
+    # Stored as plain dicts (``{"name", "version", "category"}``) so the
+    # persistence layer can serialise without importing the editor_files
+    # data module. Populated post-traversal during the graph build phase.
+    tech_stack: list[dict] = field(default_factory=list)
+
+    # External systems parsed from repo manifests (package.json,
+    # pyproject.toml, Cargo.toml, go.mod, .csproj). Powers the C4 L1
+    # System Context view. Plain dicts mirroring ExternalSystemRecord fields
+    # for the same reason as tech_stack.
+    external_systems: list[dict] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -143,6 +205,7 @@ async def run_pipeline(
     skip_infra: bool = False,
     exclude_patterns: list[str] | None = None,
     include_submodules: bool = False,
+    include_nested_repos: bool = False,
     generate_docs: bool = False,
     llm_client: Any | None = None,
     embedder: Any | None = None,
@@ -152,6 +215,7 @@ async def run_pipeline(
     resume: bool = False,
     progress: ProgressCallback | None = None,
     cost_tracker: Any | None = None,
+    generation_config: Any | None = None,
 ) -> PipelineResult:
     """Run the repowise indexing/analysis/generation pipeline.
 
@@ -186,6 +250,10 @@ async def run_pipeline(
         Limit generation to top 10 files by PageRank (for quick validation).
     progress:
         Optional callback for progress reporting. Pass None for silent operation.
+    generation_config:
+        Optional ``GenerationConfig`` used for page generation. When omitted,
+        generation uses repo-local config such as ``reasoning`` from
+        ``.repowise/config.yaml`` and ``REPOWISE_REASONING``.
 
     Returns
     -------
@@ -223,6 +291,7 @@ async def run_pipeline(
             repo_path,
             exclude_patterns=exclude_patterns,
             include_submodules=include_submodules,
+            include_nested_repos=include_nested_repos,
             skip_tests=skip_tests,
             skip_infra=skip_infra,
             progress=progress,
@@ -236,6 +305,7 @@ async def run_pipeline(
             source_map,
             graph_builder,
             traversal_stats,
+            tech_items,
         ),
         (
             git_summary,
@@ -247,6 +317,37 @@ async def run_pipeline(
     # Add co-change edges to the graph
     if git_meta_map:
         graph_builder.add_co_change_edges(git_meta_map)
+
+    # ---- External systems (C4 L1) ------------------------------------------
+    # Parse repo manifests for declared third-party dependencies. Failure here
+    # must not break the pipeline — log and continue with an empty list.
+    external_systems: list[dict] = []
+    if progress:
+        progress.on_phase_start("external_systems", None)
+    try:
+        from repowise.core.ingestion.external_systems import extract_external_systems
+
+        records = await asyncio.to_thread(extract_external_systems, repo_path)
+        external_systems = [
+            {
+                "name": r.name,
+                "display_name": r.display_name,
+                "ecosystem": r.ecosystem,
+                "category": r.category,
+                "version": r.version,
+                "declared_in": r.declared_in,
+                "is_dev_dep": r.is_dev_dep,
+            }
+            for r in records
+        ]
+        if progress and external_systems:
+            progress.on_message(
+                "info",
+                f"→ External systems: {len(external_systems):,} declared deps across manifests",
+            )
+    except Exception as _ext_err:
+        logger.warning("external_systems_extraction_failed", error=str(_ext_err))
+    _phase_done(progress, "external_systems")
 
     # Emit rich insight summary for the ingestion phase
     if progress:
@@ -293,6 +394,10 @@ async def run_pipeline(
 
     dead_code_report = await _run_dead_code_analysis(graph_builder, git_meta_map, progress=progress)
 
+    health_report = await _run_health_analysis(
+        graph_builder, git_meta_map, parsed_files, repo_path=repo_path, progress=progress
+    )
+
     decision_report = await _run_decision_extraction(
         repo_path,
         llm_client=llm_client,
@@ -308,6 +413,31 @@ async def run_pipeline(
         if progress:
             progress.on_message("info", "Phase 3: Generation")
 
+        resolved_generation_config = generation_config
+        if resolved_generation_config is None:
+            from repowise.core.generation import GenerationConfig
+            from repowise.core.reasoning import resolve_reasoning
+            from repowise.core.repo_config import load_repo_config
+
+            resolved_generation_config = GenerationConfig(
+                max_concurrency=concurrency,
+                reasoning=resolve_reasoning(config=load_repo_config(repo_path)),
+            )
+
+        # Phase 2 enrichment: flag framework-defined HTTP surfaces (FastAPI,
+        # ASP.NET controllers, …) as api_contract so they route through the
+        # api_contract template instead of generic file_page. Lives in the
+        # generation package so language-specific heuristics stay co-located
+        # with the templates that consume them.
+        from repowise.core.generation import detect_code_api_contracts as _detect_apis
+
+        try:
+            flipped = _detect_apis(parsed_files)
+            if flipped and progress:
+                progress.on_message("info", f"→ Detected {flipped} additional API contract file(s)")
+        except Exception as _api_err:
+            logger.warning("api_contract_detection_failed", error=str(_api_err))
+
         generated_pages = await run_generation(
             repo_path=repo_path,
             parsed_files=parsed_files,
@@ -321,14 +451,21 @@ async def run_pipeline(
             concurrency=concurrency,
             progress=progress,
             resume=resume,
+            generation_config=resolved_generation_config,
+            dead_code_report=dead_code_report,
+            decision_report=decision_report,
+            external_systems=external_systems,
         )
 
     # ---- Execution flow tracing -----------------------------------------------
     execution_flow_report = None
+    if progress:
+        progress.on_phase_start("graph.flows", None)
     try:
-        execution_flow_report = graph_builder.execution_flows()
+        execution_flow_report = await asyncio.to_thread(graph_builder.execution_flows)
     except Exception as _flow_err:
         logger.warning("execution_flow_tracing_skipped", error=str(_flow_err))
+    _phase_done(progress, "graph.flows")
 
     # ---- Build result -------------------------------------------------------
     elapsed = time.monotonic() - start
@@ -346,6 +483,7 @@ async def run_pipeline(
         git_summary=git_summary,
         dead_code_report=dead_code_report,
         decision_report=decision_report,
+        health_report=health_report,
         execution_flow_report=execution_flow_report,
         generated_pages=generated_pages,
         traversal_stats=traversal_stats,
@@ -354,6 +492,10 @@ async def run_pipeline(
         symbol_count=symbol_count,
         languages=languages,
         elapsed_seconds=elapsed,
+        tech_stack=[
+            {"name": t.name, "version": t.version, "category": t.category} for t in tech_items
+        ],
+        external_systems=external_systems,
     )
 
 
@@ -367,13 +509,15 @@ async def _run_ingestion(
     *,
     exclude_patterns: list[str] | None,
     include_submodules: bool = False,
+    include_nested_repos: bool = False,
     skip_tests: bool,
     skip_infra: bool,
     progress: ProgressCallback | None,
 ) -> tuple[list[Any], list[Any], Any, dict[str, bytes], Any, Any]:
     """Traverse, parse, and build the dependency graph.
 
-    Returns (parsed_files, file_infos, repo_structure, source_map, graph_builder, traversal_stats).
+    Returns (parsed_files, file_infos, repo_structure, source_map,
+    graph_builder, traversal_stats, tech_items).
     """
     from repowise.core.ingestion import ASTParser, FileTraverser, GraphBuilder
 
@@ -381,6 +525,7 @@ async def _run_ingestion(
         repo_path,
         extra_exclude_patterns=exclude_patterns or None,
         include_submodules=include_submodules,
+        include_nested_repos=include_nested_repos,
     )
 
     # Walk directory tree
@@ -414,6 +559,7 @@ async def _run_ingestion(
         await asyncio.to_thread(io_pool.shutdown, wait=True)
 
     repo_structure = traverser.get_repo_structure(file_infos)
+    _phase_done(progress, "traverse")
 
     # Filter
     if skip_tests:
@@ -453,9 +599,17 @@ async def _run_ingestion(
     try:
         with ProcessPoolExecutor(max_workers=workers) as pool:
             tasks = [loop.run_in_executor(pool, _parse_one, item) for item in fi_and_bytes]
-            # Use as_completed via asyncio.as_completed to report per-file progress.
-            # We need to preserve (task → fi_and_bytes index) for source_map so we
-            # wrap tasks in a list and drain with gather instead.
+            # Tick the parse-progress bar as each worker finishes —
+            # ``asyncio.gather`` would otherwise hold every event back
+            # until the last file is done, which on PowerToys-scale
+            # repos looked like a hang at ``0/N`` for many minutes.
+            # Per-task done-callbacks fire on the event loop thread and
+            # preserve gather's ordered results, so the aggregation
+            # loop below still indexes ``fi_and_bytes`` correctly.
+            if progress is not None:
+                _parse_tick = lambda _fut: progress.on_item_done("parse")  # noqa: E731
+                for fut in tasks:
+                    fut.add_done_callback(_parse_tick)
             parse_results = await asyncio.gather(*tasks, return_exceptions=True)
     except Exception as pool_exc:
         logger.warning(
@@ -488,28 +642,45 @@ async def _run_ingestion(
             parsed_files.append(result)
             source_map[fi.path] = source
             graph_builder.add_file(result)
-        # Report per-file progress if we used the process pool (fallback already reported above).
-        if _use_process_pool and progress:
-            progress.on_item_done("parse")
+        # Process-pool path already ticked per-file via the done-callback
+        # attached above; only the fallback path ticks here (handled in
+        # its own loop). No tick needed in aggregation.
+
+    _phase_done(progress, "parse")
 
     # ---- tsconfig path-alias resolver (before graph build) ------------------
+    # Only runs when the repo has TS/JS files. On large TS monorepos the
+    # resolver indexes hundreds of tsconfig files up-front; without a phase
+    # label this shows up as a silent gap right after parsing.
     try:
         from repowise.core.ingestion.tsconfig_resolver import TsconfigResolver
 
         _ts_langs = {"typescript", "javascript"}
         if any(pf.file_info.language in _ts_langs for pf in parsed_files):
+            if progress:
+                progress.on_phase_start("tsconfig", None)
             _path_set = set(graph_builder._parsed_files.keys())
             _resolver = TsconfigResolver(repo_path=repo_path, path_set=_path_set)
             graph_builder.set_tsconfig_resolver(_resolver)
+            _phase_done(progress, "tsconfig")
     except Exception as _resolver_exc:
         logger.warning("tsconfig_resolver_init_failed", error=str(_resolver_exc))
 
     # ---- Graph build phase -------------------------------------------------
+    # Sub-phases (graph.imports / graph.heritage / graph.calls) are emitted
+    # from inside GraphBuilder.build(); the orchestrator drives metrics/
+    # communities/flows below so the longest-running step is no longer an
+    # opaque "graph 0/1" spinner.
     if progress:
-        progress.on_phase_start("graph", 1)
-    await asyncio.to_thread(graph_builder.build)
+        progress.on_message(
+            "info",
+            "  (graph build can take several minutes on first run — safe to "
+            "Ctrl-C, then run 'repowise init --resume' to continue)",
+        )
+    await asyncio.to_thread(graph_builder.build, progress)
 
     # Add framework-aware synthetic edges (conftest, Django, FastAPI, Flask)
+    tech_items: list = []
     try:
         from repowise.core.generation.editor_files.tech_stack import detect_tech_stack
 
@@ -519,6 +690,8 @@ async def _run_ingestion(
         pass  # framework edge detection is best-effort
 
     # ---- Dynamic hints wiring (after static graph is fully built) ----------
+    if progress:
+        progress.on_phase_start("dynamic_hints", None)
     try:
         from repowise.core.ingestion.dynamic_hints import HintRegistry
 
@@ -528,9 +701,38 @@ async def _run_ingestion(
         logger.info("dynamic_hints_added", count=len(dynamic_edges))
     except Exception as hints_exc:
         logger.warning("dynamic_hints_failed", error=str(hints_exc))
+    _phase_done(progress, "dynamic_hints")
+
+    # ---- Graph metrics: prime caches with live progress ---------------------
+    # pagerank/betweenness/community/symbol_communities/execution_flows are
+    # otherwise computed lazily during persist + generation, where they hide
+    # behind opaque progress bars. Pre-compute them here so each is its own
+    # visible sub-phase, and fan the within-phase work out via
+    # asyncio.gather so betweenness (the dominant cost) overlaps with
+    # PageRank / community detection rather than running serially.
+    #
+    # Each algorithm is wrapped in ``_timed_step`` so we emit a per-algo
+    # completion line (`  ↳ PageRank ✓ (Xs)`) as it finishes. Without these,
+    # the whole gather looks like one opaque several-minute void where
+    # betweenness centrality dominates — splitting the timing makes it
+    # obvious which step is the bottleneck on a given repo.
+    if progress:
+        progress.on_phase_start("graph.metrics", None)
+    await asyncio.gather(
+        _timed_step("PageRank", graph_builder.pagerank, progress),
+        _timed_step("betweenness centrality", graph_builder.betweenness_centrality, progress),
+        _timed_step("symbol PageRank", graph_builder.symbol_pagerank, progress),
+        _timed_step("symbol betweenness", graph_builder.symbol_betweenness_centrality, progress),
+    )
+    _phase_done(progress, "graph.metrics")
 
     if progress:
-        progress.on_item_done("graph")
+        progress.on_phase_start("graph.communities", None)
+    await asyncio.gather(
+        _timed_step("community detection", graph_builder.community_detection, progress),
+        _timed_step("symbol communities", graph_builder.symbol_communities, progress),
+    )
+    _phase_done(progress, "graph.communities")
 
     # Emit filtering summary so users can see what was included/excluded
     stats = traverser.stats
@@ -554,6 +756,8 @@ async def _run_ingestion(
             parts.append(f"{stats.skipped_extra_ignore:,} by .repowiseIgnore")
         if stats.skipped_submodule:
             parts.append(f"{stats.skipped_submodule:,} submodule dirs")
+        if stats.skipped_nested_repo:
+            parts.append(f"{stats.skipped_nested_repo:,} nested git repos")
         if stats.skipped_unknown_language:
             parts.append(f"{stats.skipped_unknown_language:,} unknown type")
 
@@ -576,7 +780,7 @@ async def _run_ingestion(
                 lang_str += f", other {rest_count:,}"
             progress.on_message("info", f"  Languages: {lang_str}")
 
-    return parsed_files, file_infos, repo_structure, source_map, graph_builder, stats
+    return parsed_files, file_infos, repo_structure, source_map, graph_builder, stats, tech_items
 
 
 async def _run_git_indexing(
@@ -615,18 +819,33 @@ async def _run_git_indexing(
             if progress:
                 progress.on_item_done("co_change")
 
+        def _on_co_change_done() -> None:
+            # Stop the co_change timer the moment accumulation finishes;
+            # otherwise the recorded duration also includes the parallel
+            # per-file git walk that keeps running afterwards (audit #29).
+            _phase_done(progress, "co_change")
+
         git_summary, git_metadata_list = await git_indexer.index_repo(
             "",
             on_start=_on_start,
             on_file_done=_on_file_done,
             on_co_change_start=_on_co_change_start,
             on_commit_done=_on_commit_done,
+            on_co_change_done=_on_co_change_done,
         )
         git_meta_map = {m["file_path"]: m for m in git_metadata_list}
+        _phase_done(progress, "git")
+        # co_change phase already closed inside the done-callback above;
+        # call again only as a safety-net in case the callback was never
+        # invoked (e.g. co-change skipped early). PhaseTimingRecorder
+        # ignores done-without-start so this is a no-op in the happy path.
+        _phase_done(progress, "co_change")
         return git_summary, git_metadata_list, git_meta_map
     except Exception as exc:
         if progress:
             progress.on_message("warning", f"Git indexing skipped: {exc}")
+        _phase_done(progress, "git")
+        _phase_done(progress, "co_change")
         return None, [], {}
 
 
@@ -640,13 +859,21 @@ async def _run_dead_code_analysis(
     try:
         from repowise.core.analysis.dead_code import DeadCodeAnalyzer
 
+        # Four detectors run sequentially inside analyze(); drive a
+        # determinate bar so users see progress instead of "0".
+        _DEAD_CODE_STEPS = 4
         if progress:
-            progress.on_phase_start("dead_code", None)
+            progress.on_phase_start("dead_code", _DEAD_CODE_STEPS)
 
         analyzer = DeadCodeAnalyzer(
             graph_builder.graph(), git_meta_map, parsed_files=graph_builder._parsed_files
         )
-        report = analyzer.analyze()
+
+        def _step(_stage: str) -> None:
+            if progress:
+                progress.on_item_done("dead_code")
+
+        report = await asyncio.to_thread(analyzer.analyze, None, on_step=_step)
 
         if progress:
             unreachable = sum(1 for f in report.findings if f.kind.value == "unreachable_file")
@@ -657,10 +884,92 @@ async def _run_dead_code_analysis(
                 f"{unused_exports} unused exports · ~{report.deletable_lines:,} deletable lines",
             )
 
+        _phase_done(progress, "dead_code")
         return report
     except Exception as exc:
         if progress:
             progress.on_message("warning", f"Dead code detection skipped: {exc}")
+        _phase_done(progress, "dead_code")
+        return None
+
+
+async def _run_health_analysis(
+    graph_builder: Any,
+    git_meta_map: dict[str, dict],
+    parsed_files: list[Any],
+    *,
+    repo_path: Path | None = None,
+    progress: ProgressCallback | None,
+) -> Any | None:
+    """Run code-health analysis (complexity + biomarkers + scoring)."""
+    try:
+        from repowise.core.analysis.health import HealthAnalyzer
+        from repowise.core.analysis.health.config import HealthConfig
+
+        if progress:
+            # Per-file determinate progress: one tick per parsed file.
+            progress.on_phase_start("health", len(parsed_files))
+
+        # Build a {file_path → community label} map so per-file metrics
+        # carry a real module name, not None. Community detection is
+        # already computed for the graph view, so this is essentially
+        # free.
+        module_map: dict[str, str] = {}
+        try:
+            cd = graph_builder.community_detection()
+            ci = graph_builder.community_info()
+            for node_id, comm_id in cd.items():
+                info = ci.get(comm_id)
+                label = getattr(info, "label", None) if info else None
+                if label:
+                    module_map[node_id] = label
+        except Exception as exc:
+            logger.debug("health_module_map_failed", error=str(exc))
+
+        analyzer = HealthAnalyzer(
+            graph_builder.graph(),
+            git_meta_map=git_meta_map,
+            parsed_files=parsed_files,
+            module_map=module_map,
+        )
+
+        # Load per-file override rules from `.repowise/health-rules.json`.
+        # Missing or malformed file → empty config (no-op).
+        analyzer_config: dict[str, object] | None = None
+        if repo_path is not None:
+            cfg = HealthConfig.load(repo_path)
+            if cfg.disabled_biomarkers or cfg.rules:
+                file_paths = [pf.file_info.path for pf in parsed_files]
+                analyzer_config = cfg.to_analyzer_config(file_paths)
+
+        def _step(_path: str) -> None:
+            if progress:
+                progress.on_item_done("health")
+
+        # Parallel path for repos large enough to benefit (tree-sitter
+        # releases the GIL during parsing, so asyncio.gather over a
+        # thread pool actually scales). Threshold chosen so small repos
+        # avoid the overhead.
+        if len(parsed_files) >= 500:
+            report = await analyzer.analyze_async(analyzer_config, on_step=_step)
+        else:
+            report = await asyncio.to_thread(analyzer.analyze, analyzer_config, on_step=_step)
+
+        if progress:
+            findings_count = len(report.findings)
+            avg = report.kpis.get("average_health", 10.0)
+            worst = report.kpis.get("worst_performer_score", 10.0)
+            progress.on_message(
+                "info",
+                f"→ {findings_count} health findings · avg {avg}/10 · worst {worst}/10",
+            )
+
+        _phase_done(progress, "health")
+        return report
+    except Exception as exc:
+        if progress:
+            progress.on_message("warning", f"Health analysis skipped: {exc}")
+        _phase_done(progress, "health")
         return None
 
 
@@ -677,8 +986,11 @@ async def _run_decision_extraction(
     try:
         from repowise.core.analysis.decision_extractor import DecisionExtractor
 
+        # Three sources run concurrently inside extract_all(); drive a
+        # determinate bar so users see live progress.
+        _DECISION_STEPS = 3
         if progress:
-            progress.on_phase_start("decisions", None)
+            progress.on_phase_start("decisions", _DECISION_STEPS)
 
         extractor = DecisionExtractor(
             repo_path=repo_path,
@@ -687,8 +999,14 @@ async def _run_decision_extraction(
             git_meta_map=git_meta_map,
             parsed_files=parsed_files,
         )
+
+        def _decision_step(_source: str) -> None:
+            if progress:
+                progress.on_item_done("decisions")
+
         report = await asyncio.wait_for(
-            extractor.extract_all(), timeout=DECISION_EXTRACTION_TIMEOUT_SECS
+            extractor.extract_all(on_step=_decision_step),
+            timeout=DECISION_EXTRACTION_TIMEOUT_SECS,
         )
 
         if progress:
@@ -701,10 +1019,12 @@ async def _run_decision_extraction(
                 f"→ {total_decisions} decisions: {inline} inline · {readme} from docs · {git_arch} from git",
             )
 
+        _phase_done(progress, "decisions")
         return report
     except Exception as exc:
         if progress:
             progress.on_message("warning", f"Decision extraction skipped: {exc}")
+        _phase_done(progress, "decisions")
         return None
 
 
@@ -723,6 +1043,10 @@ async def run_generation(
     progress: ProgressCallback | None,
     resume: bool = False,
     cost_tracker: Any | None = None,
+    generation_config: Any | None = None,
+    dead_code_report: Any | None = None,
+    decision_report: Any | None = None,
+    external_systems: list[dict] | None = None,
 ) -> list[Any]:
     """Run LLM-powered page generation.
 
@@ -730,7 +1054,6 @@ async def run_generation(
     """
     from repowise.core.generation import (
         ContextAssembler,
-        GenerationConfig,
         JobSystem,
         PageGenerator,
     )
@@ -741,7 +1064,13 @@ async def run_generation(
     if cost_tracker is not None and llm_client is not None and hasattr(llm_client, "_cost_tracker"):
         llm_client._cost_tracker = cost_tracker
 
-    config = GenerationConfig(max_concurrency=concurrency)
+    from repowise.core.generation import GenerationConfig
+
+    # Preserve all caller-supplied GenerationConfig fields (output language, cache flags,
+    # token budgets, etc.) and only override max_concurrency to match the resolved value.
+    # Falls back to defaults when the pipeline entry point did not thread one through.
+    base_config = generation_config if generation_config is not None else GenerationConfig()
+    config = replace(base_config, max_concurrency=concurrency)
     assembler = ContextAssembler(config)
 
     # Resolve embedder and vector store
@@ -750,8 +1079,6 @@ async def run_generation(
     if vector_store is None:
         vector_store = InMemoryVectorStore(embedder_impl)
 
-    generator = PageGenerator(llm_client, assembler, config, vector_store=vector_store)
-
     # Job system — use a temp-like dir under repo_path for checkpoints
     jobs_dir = repo_path / ".repowise" / "jobs"
     jobs_dir.mkdir(parents=True, exist_ok=True)
@@ -759,14 +1086,17 @@ async def run_generation(
 
     repo_name = repo_path.name
 
-    # Track generation progress
+    # Track generation progress. Onboarding pages get routed to their own
+    # phase so the terminal UI shows them as a distinct, named step rather
+    # than blending into the long file_page run.
     _pages_done = 0
 
     def on_page_done(page_type: str) -> None:
         nonlocal _pages_done
         _pages_done += 1
         if progress:
-            progress.on_item_done("generation")
+            phase = "onboarding" if page_type == "onboarding" else "generation"
+            progress.on_item_done(phase)
             # Push live cost update if the callback supports it
             if cost_tracker is not None and hasattr(progress, "set_cost"):
                 progress.set_cost(cost_tracker.session_cost)
@@ -778,6 +1108,19 @@ async def run_generation(
         if progress:
             progress.on_phase_start("generation", total)
 
+    def on_subphase(name: str, total: int | None) -> None:
+        """Start a distinct sub-phase (currently used only for onboarding)."""
+        if progress:
+            progress.on_phase_start(name, total)
+
+    generator = PageGenerator(
+        llm_client,
+        assembler,
+        config,
+        vector_store=vector_store,
+        language=config.language,
+    )
+
     generated_pages = await generator.generate_all(
         parsed_files,
         source_map,
@@ -787,12 +1130,35 @@ async def run_generation(
         job_system=job_system,
         on_page_done=on_page_done,
         on_total_known=on_total_known,
+        on_subphase=on_subphase,
         git_meta_map=git_meta_map if git_meta_map else None,
         resume=resume,
         repo_path=repo_path,
+        dead_code_report=dead_code_report,
+        decision_report=decision_report,
+        external_systems=external_systems,
     )
 
+    # Onboarding summary — count generated slots and surface which ones
+    # were gated out so the user can see the curated collection's state.
+    onboarding_generated = [p for p in generated_pages if p.page_type == "onboarding"]
+    promoted_present = {
+        p.metadata.get("onboarding_slot")
+        for p in generated_pages
+        if p.metadata.get("onboarding_slot")
+        and p.page_type in ("repo_overview", "architecture_diagram")
+    }
     if progress:
+        if onboarding_generated or promoted_present:
+            slots_made = sorted(
+                {p.metadata.get("subkind", "?") for p in onboarding_generated} | promoted_present
+            )
+            progress.on_message(
+                "info",
+                f"Onboarding: {len(slots_made)}/8 slots — {', '.join(slots_made)}",
+            )
         progress.on_message("info", f"Generated {len(generated_pages)} pages")
+    _phase_done(progress, "onboarding")
+    _phase_done(progress, "generation")
 
     return generated_pages

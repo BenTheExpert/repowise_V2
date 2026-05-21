@@ -26,7 +26,7 @@ share/python-wheels/
 venv/
 ENV/
 env/
-
+/papers/
 # uv
 .uv/
 
@@ -120,4 +120,43 @@ ehthumbs.db
 # Internal docs (not for distribution)
 docs/COMPETITIVE_ANALYSIS.md
 docs/GRAPH_INTELLIGENCE_UPGRADE.md
+docs/LOCAL_DEV.md
 docs/multi-repo/
+
+# Local-only language work tracker (not for git)
+docs/LANGUAGE_REMAINING_WORK.md
+
+# Local UI/UX audit notes
+AUDIT_UI_UX.md
+docs/WEB_UI_IMPROVEMENT_PLAN.md
+docs/WORKSPACE_ROBUSTNESS.md
+
+# Local demo scripts (not for distribution)
+demo/
+
+# Local scratch — dead-code analysis & R2 tooling
+_pip_check/
+content_engine/
+analyze_findings.py
+fetch_r2.py
+upload_r2.py
+filter_dead_code.py
+inspect_*.py
+eshop_hosted_dead_code.*
+
+# Local scratch / sibling tools (not for distribution)
+GitNexus/
+graphify/
+test-repos/
+
+# Office temp / lock files
+~$*
+*.zip
+
+# Local hosted-product planning (not for OSS distribution)
+docs/IXOPAY_FEATURES.md
+docs/IXOPAY_FEATURES.docx
+docs/HOSTED_PRODUCT_UPGRADE_PLAN.md
+docs/HOSTED_IMPLEMENTATION_GUIDE.md
+docs/HOSTED_PROGRESS.md
+scripts/md_to_docx.py

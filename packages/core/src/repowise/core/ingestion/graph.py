@@ -34,7 +34,8 @@ import structlog
 
 from .models import ParsedFile
 from .resolvers import ResolverContext, resolve_import
-from .resolvers.go import read_go_module_path
+from .resolvers.go import read_go_module_path, read_go_modules
+from .type_ref_resolution import resolve_type_refs
 
 log = structlog.get_logger(__name__)
 
@@ -100,11 +101,16 @@ class GraphBuilder:
         self._repo_path: Path | None = Path(repo_path) if repo_path else None
         self._tsconfig_resolver: Any | None = None  # TsconfigResolver (lazy import)
 
-        # Community / flow caches (invalidated on build)
+        # Community / flow / metric caches (invalidated on build)
         self._community_cache: dict[str, int] | None = None
         self._symbol_community_cache: dict[str, int] | None = None
         self._community_info_cache: dict[int, Any] | None = None
         self._community_algo: str = ""
+        self._pagerank_cache: dict[str, float] | None = None
+        self._betweenness_cache: dict[str, float] | None = None
+        self._symbol_pagerank_cache: dict[str, float] | None = None
+        self._symbol_betweenness_cache: dict[str, float] | None = None
+        self._execution_flow_cache: Any | None = None
 
     def set_tsconfig_resolver(self, resolver: Any) -> None:
         """Attach a :class:`TsconfigResolver` for TS/JS path-alias resolution."""
@@ -147,6 +153,8 @@ class GraphBuilder:
                 language=sym.language,
                 parent_name=sym.parent_name,
                 signature=sym.signature,
+                decorators=sym.decorators,
+                is_exported_symbol=sym.is_exported_symbol,
             )
 
             # DEFINES edge: file → symbol
@@ -181,13 +189,24 @@ class GraphBuilder:
         )
         self._graph.add_edge(path, module_sym_id, edge_type="defines")
 
-    def build(self) -> nx.DiGraph:
-        """Resolve imports and calls, add edges. Returns the finalized graph."""
+    def build(self, progress: Any | None = None) -> nx.DiGraph:
+        """Resolve imports and calls, add edges. Returns the finalized graph.
+
+        *progress* is an optional ``ProgressCallback`` (duck-typed). When
+        provided, sub-phase events ``graph.imports`` / ``graph.heritage`` /
+        ``graph.calls`` are emitted so the CLI can surface per-file progress
+        instead of a single opaque "0/1" bar over the whole build.
+        """
         # Invalidate cached metrics
         self._community_cache = None
         self._symbol_community_cache = None
         self._community_info_cache = None
         self._community_algo = ""
+        self._pagerank_cache = None
+        self._betweenness_cache = None
+        self._symbol_pagerank_cache = None
+        self._symbol_betweenness_cache = None
+        self._execution_flow_cache = None
 
         # Clear import/call edges but keep structural edges (defines, has_method)
         edges_to_remove = [
@@ -202,20 +221,44 @@ class GraphBuilder:
         stem_map = self._build_stem_map(path_set)
 
         # Construct resolver context
+        go_modules = read_go_modules(self._repo_path)
         ctx = ResolverContext(
             path_set=path_set,
             stem_map=stem_map,
             graph=self._graph,
             repo_path=self._repo_path,
             tsconfig_resolver=self._tsconfig_resolver,
-            go_module_path=read_go_module_path(self._repo_path),
+            go_module_path=(go_modules[-1][1] if go_modules else read_go_module_path(self._repo_path)),
+            go_modules=go_modules,
+            has_sfc_files=any(
+                p.endswith((".vue", ".svelte", ".astro")) for p in path_set
+            ),
             parsed_files=self._parsed_files,
         )
+
+        # --- Phase 1 prelude: language-specific warmups ---
+        # Some languages need an expensive one-time index built before any
+        # per-file import resolution can run. Doing it here, under a dedicated
+        # phase event, keeps the cost out of ``graph.imports`` and surfaces
+        # a meaningful progress label instead of a stuck per-file bar.
+        from .graph_warmups import run_warmups
+
+        run_warmups(self._parsed_files, ctx, progress=progress)
 
         # --- Phase 1: Resolve file-level imports ---
         import_targets: dict[str, set[str]] = {}  # file → set of imported files
 
+        # Per-language import-resolution timing — surfaces which language is
+        # actually dominating the import loop on multi-language repos
+        # (audit #30). Persisted to state.json for after-the-fact analysis.
+        import time as _t
+        lang_import_time: dict[str, float] = {}
+
+        if progress:
+            progress.on_phase_start("graph.imports", len(self._parsed_files))
         for path, parsed in self._parsed_files.items():
+            _lang = parsed.file_info.language
+            _t0 = _t.monotonic()
             file_imports: set[str] = set()
             for imp in parsed.imports:
                 target = resolve_import(imp.module_path, path, parsed.file_info.language, ctx)
@@ -235,12 +278,54 @@ class GraphBuilder:
                             imported_names=list(imp.imported_names),
                         )
             import_targets[path] = file_imports
+            lang_import_time[_lang] = lang_import_time.get(_lang, 0.0) + (_t.monotonic() - _t0)
+            if progress:
+                progress.on_item_done("graph.imports")
+        if progress:
+            _phase_done = getattr(progress, "on_phase_done", None)
+            if _phase_done is not None:
+                _phase_done("graph.imports")
+        if lang_import_time:
+            log.info(
+                "import_resolution_per_language",
+                seconds={k: round(v, 2) for k, v in lang_import_time.items()},
+            )
+
+        # --- Phase 1b: Resolve non-import type references (e.g. C# ctor params) ---
+        # Lives between import resolution and heritage so the type-use
+        # edges feed into heritage's import_targets propagation if a
+        # future language emits them, and so dead-code reachability
+        # sees every edge before any analysis pass runs.
+        if progress:
+            progress.on_phase_start("graph.type_refs", len(self._parsed_files))
+        type_use_counts = resolve_type_refs(self._parsed_files, ctx, self._graph)
+        for path in self._parsed_files:
+            for _, target, data in self._graph.out_edges(path, data=True):
+                # Treat both real ``using`` imports and synthesised
+                # type-use edges as import-like for downstream heritage
+                # / call resolution. Without this, type-use edges would
+                # only contribute to file-reachability — not to
+                # ``import_targets`` which gates cross-file call /
+                # heritage lookups.
+                if data.get("edge_type") in ("imports", "type_use"):
+                    import_targets.setdefault(path, set()).add(target)
+        if progress:
+            _phase_done = getattr(progress, "on_phase_done", None)
+            if _phase_done is not None:
+                _phase_done("graph.type_refs")
+        del type_use_counts  # used only for logging inside resolve_type_refs
+
+        # --- Phase 1c: Resolve C# member-access reads ---
+        # Bind `var x = new T(...); ... x.Prop` style property reads
+        # to T's defining file. Cuts the largest single bucket of C#
+        # unused_export false positives (audit #23).
+        self._resolve_member_reads(progress=progress)
 
         # --- Phase 2: Resolve heritage (extends/implements) ---
-        self._resolve_heritage(import_targets)
+        self._resolve_heritage(import_targets, progress=progress)
 
         # --- Phase 3: Resolve symbol-level calls ---
-        self._resolve_calls(import_targets)
+        self._resolve_calls(import_targets, progress=progress)
 
         self._built = True
 
@@ -266,17 +351,23 @@ class GraphBuilder:
         )
         return self._graph
 
-    def _resolve_heritage(self, import_targets: dict[str, set[str]]) -> None:
+    def _resolve_heritage(
+        self,
+        import_targets: dict[str, set[str]],
+        progress: Any | None = None,
+    ) -> None:
         """Resolve heritage relations and add EXTENDS/IMPLEMENTS edges."""
         from .heritage_resolver import HeritageResolver
 
         resolver = HeritageResolver(self._parsed_files, import_targets)
         total_resolved = 0
 
-        for path, parsed in self._parsed_files.items():
-            if not parsed.heritage:
-                continue
-
+        files_with_heritage = [
+            (p, pf) for p, pf in self._parsed_files.items() if pf.heritage
+        ]
+        if progress:
+            progress.on_phase_start("graph.heritage", len(files_with_heritage))
+        for path, parsed in files_with_heritage:
             resolved = resolver.resolve_file(path, parsed.heritage)
             for rh in resolved:
                 if rh.child_id in self._graph and rh.parent_id in self._graph:
@@ -292,20 +383,68 @@ class GraphBuilder:
                         existing = self._graph[rh.child_id][rh.parent_id]
                         if rh.confidence > existing.get("confidence", 0):
                             existing["confidence"] = rh.confidence
+            if progress:
+                progress.on_item_done("graph.heritage")
 
+        if progress:
+            _phase_done = getattr(progress, "on_phase_done", None)
+            if _phase_done is not None:
+                _phase_done("graph.heritage")
         log.info("Heritage edges resolved", total=total_resolved)
 
-    def _resolve_calls(self, import_targets: dict[str, set[str]]) -> None:
+    def _resolve_member_reads(self, progress: Any | None = None) -> None:
+        """Phase 1c: emit ``reads`` edges for C# property / member access.
+
+        Runs after type-use resolution so the dead-code analyser sees
+        member access as evidence of reachability. The pass is C#-only
+        today (the lever is largest there); the helper module is set
+        up to receive other languages via additional strategies.
+        """
+        from .languages.csharp_member_reads import (
+            build_csharp_type_to_file,
+            collect_csharp_source_texts,
+            resolve_csharp_member_reads,
+        )
+
+        has_csharp = any(
+            pf.file_info.language == "csharp" for pf in self._parsed_files.values()
+        )
+        if not has_csharp:
+            return
+
+        phase = "graph.member_reads"
+        if progress:
+            progress.on_phase_start(phase, None)
+        try:
+            cs_texts = collect_csharp_source_texts(self._parsed_files)
+            type_to_file = build_csharp_type_to_file(self._parsed_files)
+            added = resolve_csharp_member_reads(self._graph, cs_texts, type_to_file)
+            log.info("member_read_edges", language="csharp", added=added)
+        except Exception as exc:
+            log.warning("member_reads_failed", error=str(exc))
+        finally:
+            if progress:
+                done = getattr(progress, "on_phase_done", None)
+                if callable(done):
+                    done(phase)
+
+    def _resolve_calls(
+        self,
+        import_targets: dict[str, set[str]],
+        progress: Any | None = None,
+    ) -> None:
         """Run three-tier call resolution and add CALLS edges to the graph."""
         from .call_resolver import CallResolver
 
         resolver = CallResolver(self._parsed_files, import_targets)
         total_resolved = 0
 
-        for path, parsed in self._parsed_files.items():
-            if not parsed.calls:
-                continue
-
+        files_with_calls = [
+            (p, pf) for p, pf in self._parsed_files.items() if pf.calls
+        ]
+        if progress:
+            progress.on_phase_start("graph.calls", len(files_with_calls))
+        for path, parsed in files_with_calls:
             resolved = resolver.resolve_file(path, parsed.calls)
             for rc in resolved:
                 if rc.caller_id in self._graph and rc.callee_id in self._graph:
@@ -321,7 +460,13 @@ class GraphBuilder:
                         existing = self._graph[rc.caller_id][rc.callee_id]
                         if rc.confidence > existing.get("confidence", 0):
                             existing["confidence"] = rc.confidence
+            if progress:
+                progress.on_item_done("graph.calls")
 
+        if progress:
+            _phase_done = getattr(progress, "on_phase_done", None)
+            if _phase_done is not None:
+                _phase_done("graph.calls")
         log.info("Call edges resolved", total=total_resolved)
 
     def graph(self) -> nx.DiGraph:
@@ -339,15 +484,20 @@ class GraphBuilder:
         return [frozenset(scc) for scc in nx.strongly_connected_components(self.file_subgraph())]
 
     def betweenness_centrality(self) -> dict[str, float]:
-        """Return betweenness centrality for file nodes."""
+        """Return betweenness centrality for file nodes (cached)."""
+        if self._betweenness_cache is not None:
+            return self._betweenness_cache
         g = self.file_subgraph()
         n = g.number_of_nodes()
         if n == 0:
-            return {}
+            self._betweenness_cache = {}
+            return self._betweenness_cache
         if n > _LARGE_REPO_THRESHOLD:
             k = min(500, n)
-            return nx.betweenness_centrality(g, k=k, normalized=True)
-        return nx.betweenness_centrality(g, normalized=True)
+            self._betweenness_cache = nx.betweenness_centrality(g, k=k, normalized=True)
+        else:
+            self._betweenness_cache = nx.betweenness_centrality(g, normalized=True)
+        return self._betweenness_cache
 
     def community_detection(self) -> dict[str, int]:
         """Assign a community ID to each file node."""
@@ -392,11 +542,16 @@ class GraphBuilder:
         return self._community_info_cache or {}
 
     def execution_flows(self, config: Any | None = None) -> Any:
-        """Trace execution flows from entry-point symbols."""
+        """Trace execution flows from entry-point symbols (cached when ``config`` is None)."""
         from repowise.core.analysis.execution_flows import (
             ExecutionFlowReport,
             trace_execution_flows,
         )
+
+        # Only the no-config path is cached — callers that pass custom
+        # FlowConfig still get a fresh trace.
+        if config is None and self._execution_flow_cache is not None:
+            return self._execution_flow_cache
 
         file_cd = self.community_detection()
         merged_cd: dict[str, int] = dict(file_cd)
@@ -411,14 +566,42 @@ class GraphBuilder:
                     merged_cd[node_id] = file_cd[file_path]
 
         try:
-            return trace_execution_flows(self._graph, merged_cd, config)
+            report = trace_execution_flows(self._graph, merged_cd, config)
         except Exception as exc:
             log.warning("execution_flow_tracing_failed", error=str(exc))
-            return ExecutionFlowReport(
+            report = ExecutionFlowReport(
                 total_entry_points_scored=0,
                 total_flows=0,
                 flows=[],
             )
+        if config is None:
+            self._execution_flow_cache = report
+        return report
+
+    async def compute_metrics_parallel(self) -> None:
+        """Eagerly populate all metric caches with fan-out parallelism.
+
+        Runs PageRank, betweenness, file/symbol community detection in
+        parallel via ``asyncio.gather`` + ``asyncio.to_thread`` (the
+        scipy- and igraph-backed kernels release the GIL during heavy
+        compute, so true parallelism is achievable). Execution flows then
+        run after, since they depend on the community caches.
+
+        Calling this is optional — every metric falls back to lazy
+        computation, so existing call sites keep working unchanged.
+        """
+        import asyncio as _asyncio
+
+        await _asyncio.gather(
+            _asyncio.to_thread(self.pagerank),
+            _asyncio.to_thread(self.betweenness_centrality),
+            _asyncio.to_thread(self.symbol_pagerank),
+            _asyncio.to_thread(self.symbol_betweenness_centrality),
+            _asyncio.to_thread(self.community_detection),
+            _asyncio.to_thread(self.symbol_communities),
+        )
+        # execution_flows reads from the community caches just primed above.
+        await _asyncio.to_thread(self.execution_flows)
 
     # ------------------------------------------------------------------
     # Serialisation
@@ -431,10 +614,12 @@ class GraphBuilder:
     async def persist(self, db_path: Path, repo_id: str) -> None:
         """Persist the graph to an SQLite database."""
         import aiosqlite
+        import sqlite3
 
         pr = self.pagerank()
         bc = self.betweenness_centrality()
         scc_map = self._build_scc_map()
+        cd = self.community_detection()
         g = self.graph()
 
         async with aiosqlite.connect(db_path) as db:
@@ -448,6 +633,7 @@ class GraphBuilder:
                     pagerank     REAL,
                     betweenness  REAL,
                     scc_id       INTEGER,
+                    community_id INTEGER DEFAULT 0,
                     PRIMARY KEY (repo_id, path)
                 );
                 CREATE TABLE IF NOT EXISTS graph_edges (
@@ -459,6 +645,13 @@ class GraphBuilder:
                 );
             """)
 
+            try:
+                await db.execute(
+                    "ALTER TABLE graph_nodes ADD COLUMN community_id INTEGER DEFAULT 0"
+                )
+            except sqlite3.OperationalError:
+                pass
+
             node_rows = [
                 (
                     repo_id,
@@ -469,11 +662,12 @@ class GraphBuilder:
                     pr.get(path, 0.0),
                     bc.get(path, 0.0),
                     scc_map.get(path, 0),
+                    cd.get(path, cd.get(data.get("file_path", ""), 0)),
                 )
                 for path, data in g.nodes(data=True)
             ]
             await db.executemany(
-                "INSERT OR REPLACE INTO graph_nodes VALUES (?,?,?,?,?,?,?,?)",
+                "INSERT OR REPLACE INTO graph_nodes VALUES (?,?,?,?,?,?,?,?,?)",
                 node_rows,
             )
 
@@ -589,10 +783,14 @@ class GraphBuilder:
                 continue
             if e.target not in self._graph:
                 self._graph.add_node(e.target)
+            sub_type = e.edge_type or "dynamic"
+            graph_edge_type = (
+                sub_type if sub_type.startswith("dynamic") else f"dynamic_{sub_type}"
+            )
             self._graph.add_edge(
                 e.source,
                 e.target,
-                edge_type="dynamic",
+                edge_type=graph_edge_type,
                 hint_source=e.hint_source,
                 weight=e.weight,
             )
@@ -611,13 +809,18 @@ class GraphBuilder:
         path_set = set(self._parsed_files.keys())
         stem_map = self._build_stem_map(path_set)
 
+        go_modules = read_go_modules(self._repo_path)
         ctx = ResolverContext(
             path_set=path_set,
             stem_map=stem_map,
             graph=self._graph,
             repo_path=self._repo_path,
             tsconfig_resolver=self._tsconfig_resolver,
-            go_module_path=read_go_module_path(self._repo_path),
+            go_module_path=(go_modules[-1][1] if go_modules else read_go_module_path(self._repo_path)),
+            go_modules=go_modules,
+            has_sfc_files=any(
+                p.endswith((".vue", ".svelte", ".astro")) for p in path_set
+            ),
             parsed_files=self._parsed_files,
         )
 
@@ -640,17 +843,82 @@ class GraphBuilder:
         return sub
 
     def pagerank(self, alpha: float = 0.85) -> dict[str, float]:
-        """Return PageRank scores for file nodes only."""
+        """Return PageRank scores for file nodes only (cached)."""
+        if self._pagerank_cache is not None:
+            return self._pagerank_cache
         filtered = self.file_subgraph()
         if filtered.number_of_nodes() == 0:
-            return {}
+            self._pagerank_cache = {}
+            return self._pagerank_cache
 
         try:
-            return nx.pagerank(filtered, alpha=alpha)
+            self._pagerank_cache = nx.pagerank(filtered, alpha=alpha)
         except nx.PowerIterationFailedConvergence:
             log.warning("PageRank did not converge, using uniform scores")
             n = filtered.number_of_nodes()
-            return {node: 1.0 / n for node in filtered.nodes()}
+            self._pagerank_cache = {node: 1.0 / n for node in filtered.nodes()}
+        return self._pagerank_cache
+
+    def symbol_subgraph(self) -> nx.DiGraph:
+        """Return a subgraph of symbol nodes connected by call + heritage edges.
+
+        File-to-symbol ``defines`` edges and class-to-method ``has_method``
+        ownership edges are dropped so that the resulting centrality
+        scores reflect call/heritage flow rather than containment.
+        """
+        g = self.graph()
+        symbol_nodes = [
+            n for n, d in g.nodes(data=True) if d.get("node_type") == "symbol"
+        ]
+        sub = g.subgraph(symbol_nodes).copy()
+        edges_to_remove = [
+            (u, v)
+            for u, v, d in sub.edges(data=True)
+            if d.get("edge_type") not in ("calls", "extends", "implements")
+        ]
+        sub.remove_edges_from(edges_to_remove)
+        return sub
+
+    def symbol_pagerank(self, alpha: float = 0.85) -> dict[str, float]:
+        """Return PageRank scores for symbol nodes only (cached).
+
+        Computed on the call/heritage symbol subgraph — this is what the
+        UI's per-symbol "graph metrics" panel reads. Without it every
+        symbol shows ``Not indexed in graph``.
+        """
+        if self._symbol_pagerank_cache is not None:
+            return self._symbol_pagerank_cache
+        sub = self.symbol_subgraph()
+        if sub.number_of_nodes() == 0:
+            self._symbol_pagerank_cache = {}
+            return self._symbol_pagerank_cache
+        try:
+            self._symbol_pagerank_cache = nx.pagerank(sub, alpha=alpha)
+        except nx.PowerIterationFailedConvergence:
+            log.warning("Symbol PageRank did not converge, using uniform scores")
+            n = sub.number_of_nodes()
+            self._symbol_pagerank_cache = {node: 1.0 / n for node in sub.nodes()}
+        return self._symbol_pagerank_cache
+
+    def symbol_betweenness_centrality(self) -> dict[str, float]:
+        """Return betweenness centrality for symbol nodes (cached)."""
+        if self._symbol_betweenness_cache is not None:
+            return self._symbol_betweenness_cache
+        sub = self.symbol_subgraph()
+        n = sub.number_of_nodes()
+        if n == 0:
+            self._symbol_betweenness_cache = {}
+            return self._symbol_betweenness_cache
+        if n > _LARGE_REPO_THRESHOLD:
+            k = min(500, n)
+            self._symbol_betweenness_cache = nx.betweenness_centrality(
+                sub, k=k, normalized=True
+            )
+        else:
+            self._symbol_betweenness_cache = nx.betweenness_centrality(
+                sub, normalized=True
+            )
+        return self._symbol_betweenness_cache
 
     def _build_scc_map(self) -> dict[str, int]:
         """Assign a numeric SCC ID to each node."""

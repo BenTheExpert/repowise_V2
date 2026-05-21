@@ -20,15 +20,18 @@ Usage:
 
 from __future__ import annotations
 
+import os
+from typing import Any, AsyncIterator
+
 import structlog
-from openai import AsyncOpenAI
 from openai import APIStatusError as _OpenAIAPIStatusError
+from openai import AsyncOpenAI
 from tenacity import (
+    RetryError,
     retry,
     retry_if_exception_type,
     stop_after_attempt,
     wait_exponential_jitter,
-    RetryError,
 )
 
 from repowise.core.providers.llm.base import (
@@ -37,10 +40,10 @@ from repowise.core.providers.llm.base import (
     ChatToolCall,
     GeneratedResponse,
     ProviderError,
+    ensure_reasoning_supported,
 )
-
-from typing import Any, AsyncIterator
 from repowise.core.rate_limiter import RateLimiter
+from repowise.core.reasoning import ReasoningMode
 
 log = structlog.get_logger(__name__)
 
@@ -76,10 +79,11 @@ class OllamaProvider(BaseProvider):
     def __init__(
         self,
         model: str = "llama3.2",
-        base_url: str = _DEFAULT_BASE_URL,
+        base_url: str | None = None,
         rate_limiter: RateLimiter | None = None,
     ) -> None:
-        self._client = AsyncOpenAI(api_key="ollama", base_url=_normalize_base_url(base_url))
+        resolved_base_url = base_url or os.environ.get("OLLAMA_BASE_URL") or _DEFAULT_BASE_URL
+        self._client = AsyncOpenAI(api_key="ollama", base_url=_normalize_base_url(resolved_base_url))
         self._model = model
         self._rate_limiter = rate_limiter
 
@@ -98,7 +102,10 @@ class OllamaProvider(BaseProvider):
         max_tokens: int = 4096,
         temperature: float = 0.3,
         request_id: str | None = None,
+        reasoning: ReasoningMode = "auto",
+        cache_hints: tuple = (),
     ) -> GeneratedResponse:
+        ensure_reasoning_supported("ollama", self._model, reasoning)
         if self._rate_limiter:
             await self._rate_limiter.acquire(estimated_tokens=max_tokens)
 

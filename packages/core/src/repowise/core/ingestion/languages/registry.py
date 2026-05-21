@@ -677,8 +677,37 @@ _SPECS: tuple[LanguageSpec, ...] = (
         grammar_package="tree_sitter_c_sharp",
         scm_file="csharp.scm",
         heritage_node_types=frozenset(
-            {"class_declaration", "interface_declaration", "struct_declaration"}
+            {
+                "class_declaration",
+                "interface_declaration",
+                "struct_declaration",
+                "record_declaration",
+            }
         ),
+        entry_point_patterns=(
+            "Program.cs",
+            "Startup.cs",
+            "MauiProgram.cs",   # .NET MAUI host bootstrap
+            "Main.cs",           # Tizen / classic console entry
+            "App.xaml.cs",       # WPF / WinUI / MAUI app shell
+        ),
+        manifest_files=(
+            "Directory.Build.props",
+            "Directory.Build.targets",
+            "Directory.Packages.props",
+            "global.json",
+            "nuget.config",
+            "NuGet.Config",
+        ),
+        lock_files=("packages.lock.json",),
+        generated_suffixes=(
+            ".g.cs",
+            ".Designer.cs",
+            ".AssemblyInfo.cs",
+            ".AssemblyAttributes.cs",
+            ".g.i.cs",
+        ),
+        blocked_dirs=("bin", "obj", ".vs", "TestResults", "packages"),
         builtin_calls=frozenset(
             {
                 "Console",
@@ -773,7 +802,9 @@ _SPECS: tuple[LanguageSpec, ...] = (
         extensions=frozenset({".swift"}),
         grammar_package="tree_sitter_swift",
         scm_file="swift.scm",
-        heritage_node_types=frozenset({"class_declaration", "protocol_declaration"}),
+        heritage_node_types=frozenset(
+            {"class_declaration", "protocol_declaration", "extension_declaration"}
+        ),
         manifest_files=("Package.swift",),
         builtin_calls=frozenset(
             {
@@ -950,6 +981,18 @@ _SPECS: tuple[LanguageSpec, ...] = (
         is_passthrough=True,
         is_api_contract=True,
     ),
+    # XAML / AXAML markup for WPF, WinUI 3, UWP, MAUI, Avalonia, Uno.
+    # No AST grammar — handled by the XamlDynamicHints extractor which
+    # emits ``dynamic_uses`` edges to bound C# types. Registered here so
+    # that the traverser surfaces a file node these edges can attach to.
+    LanguageSpec(
+        tag="xaml",
+        display_name="XAML",
+        extensions=frozenset({".xaml", ".axaml"}),
+        is_code=False,
+        is_passthrough=True,
+        color_hex="#0C479C",
+    ),
     # -----------------------------------------------------------------
     # Extra languages — git blame coverage only (passthrough + is_code)
     # These exist so git_indexer tracks their history even though
@@ -974,10 +1017,44 @@ _SPECS: tuple[LanguageSpec, ...] = (
         is_passthrough=True,
     ),
     LanguageSpec(
-        tag="lua",
-        display_name="Lua",
-        extensions=frozenset({".lua"}),
-        is_passthrough=True,
+        tag="luau",
+        display_name="Luau",
+        # Rojo treats both .lua and .luau as Luau modules.  Luau's grammar is
+        # a superset of Lua 5.1, so vanilla Lua files parse cleanly too.
+        extensions=frozenset({".lua", ".luau"}),
+        grammar_package="tree_sitter_luau",
+        scm_file="luau.scm",
+        heritage_node_types=frozenset(),
+        entry_point_patterns=("init.luau", "init.lua"),
+        manifest_files=("default.project.json", "wally.toml", ".rojo.json"),
+        blocked_dirs=("Packages", "ServerPackages", "DevPackages"),
+        builtin_calls=frozenset(
+            {
+                "print",
+                "warn",
+                "error",
+                "assert",
+                "pcall",
+                "xpcall",
+                "select",
+                "type",
+                "typeof",
+                "tonumber",
+                "tostring",
+                "ipairs",
+                "pairs",
+                "next",
+                "rawget",
+                "rawset",
+                "rawequal",
+                "rawlen",
+                "setmetatable",
+                "getmetatable",
+                "unpack",
+                "require",
+            }
+        ),
+        color_hex="#00A2FF",
     ),
     LanguageSpec(
         tag="r",

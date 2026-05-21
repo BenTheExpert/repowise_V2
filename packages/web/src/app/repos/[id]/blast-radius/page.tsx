@@ -4,222 +4,16 @@ import { useState } from "react";
 import useSWR from "swr";
 import { useParams } from "next/navigation";
 import { Radar, Plus, Flame } from "lucide-react";
-import { Button } from "@/components/ui/button";
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
-import { cn } from "@/lib/utils/cn";
-import {
-  analyzeBlastRadius,
-  type BlastRadiusResponse,
-  type DirectRiskEntry,
-  type TransitiveEntry,
-  type CochangeWarning,
-  type ReviewerEntry,
-} from "@/lib/api/blast-radius";
-import { getHotspots } from "@/lib/api/git";
-
-// ---------------------------------------------------------------------------
-// Risk score gauge card
-// ---------------------------------------------------------------------------
-
-function RiskScoreCard({ score }: { score: number }) {
-  const color =
-    score >= 7
-      ? "text-red-500 border-red-500/30 bg-red-500/5"
-      : score >= 4
-        ? "text-amber-500 border-amber-500/30 bg-amber-500/5"
-        : "text-emerald-500 border-emerald-500/30 bg-emerald-500/5";
-  const label = score >= 7 ? "High Risk" : score >= 4 ? "Medium Risk" : "Low Risk";
-
-  return (
-    <Card className={cn("border", color)}>
-      <CardContent className="flex flex-col items-center justify-center py-8 gap-2">
-        <span className={cn("text-6xl font-bold tabular-nums", color.split(" ")[0])}>
-          {score.toFixed(1)}
-        </span>
-        <span className={cn("text-sm font-medium", color.split(" ")[0])}>{label}</span>
-        <span className="text-xs text-[var(--color-text-tertiary)]">Overall Risk Score (0–10)</span>
-      </CardContent>
-    </Card>
-  );
-}
-
-// ---------------------------------------------------------------------------
-// Simple table helpers
-// ---------------------------------------------------------------------------
-
-function TableSection({
-  title,
-  children,
-  empty,
-}: {
-  title: string;
-  children: React.ReactNode;
-  empty: boolean;
-}) {
-  return (
-    <Card>
-      <CardHeader className="pb-3">
-        <CardTitle className="text-sm">{title}</CardTitle>
-      </CardHeader>
-      <CardContent className="pt-0">
-        {empty ? (
-          <p className="text-xs text-[var(--color-text-tertiary)] py-2">None</p>
-        ) : (
-          children
-        )}
-      </CardContent>
-    </Card>
-  );
-}
-
-function Th({ children }: { children: React.ReactNode }) {
-  return (
-    <th className="text-left text-xs font-medium text-[var(--color-text-tertiary)] py-1.5 pr-4 whitespace-nowrap">
-      {children}
-    </th>
-  );
-}
-
-function Td({ children, className }: { children: React.ReactNode; className?: string }) {
-  return (
-    <td
-      className={cn(
-        "text-xs text-[var(--color-text-secondary)] py-1.5 pr-4 align-top",
-        className,
-      )}
-    >
-      {children}
-    </td>
-  );
-}
-
-// ---------------------------------------------------------------------------
-// Result tables
-// ---------------------------------------------------------------------------
-
-function DirectRisksTable({ rows }: { rows: DirectRiskEntry[] }) {
-  return (
-    <div className="overflow-x-auto">
-      <table className="w-full">
-        <thead>
-          <tr>
-            <Th>File</Th>
-            <Th>Risk Score</Th>
-            <Th>Temporal Hotspot</Th>
-            <Th>Centrality</Th>
-          </tr>
-        </thead>
-        <tbody>
-          {rows.map((r) => (
-            <tr key={r.path} className="border-t border-[var(--color-border-default)]">
-              <Td>
-                <span className="font-mono break-all">{r.path}</span>
-              </Td>
-              <Td>{r.risk_score.toFixed(4)}</Td>
-              <Td>{r.temporal_hotspot.toFixed(4)}</Td>
-              <Td>{r.centrality.toFixed(6)}</Td>
-            </tr>
-          ))}
-        </tbody>
-      </table>
-    </div>
-  );
-}
-
-function TransitiveTable({ rows }: { rows: TransitiveEntry[] }) {
-  return (
-    <div className="overflow-x-auto">
-      <table className="w-full">
-        <thead>
-          <tr>
-            <Th>File</Th>
-            <Th>Depth</Th>
-          </tr>
-        </thead>
-        <tbody>
-          {rows.map((r) => (
-            <tr key={r.path} className="border-t border-[var(--color-border-default)]">
-              <Td>
-                <span className="font-mono break-all">{r.path}</span>
-              </Td>
-              <Td>{r.depth}</Td>
-            </tr>
-          ))}
-        </tbody>
-      </table>
-    </div>
-  );
-}
-
-function CochangeTable({ rows }: { rows: CochangeWarning[] }) {
-  return (
-    <div className="overflow-x-auto">
-      <table className="w-full">
-        <thead>
-          <tr>
-            <Th>Changed File</Th>
-            <Th>Missing Partner</Th>
-            <Th>Co-change Count</Th>
-          </tr>
-        </thead>
-        <tbody>
-          {rows.map((r, i) => (
-            <tr key={i} className="border-t border-[var(--color-border-default)]">
-              <Td>
-                <span className="font-mono break-all">{r.changed}</span>
-              </Td>
-              <Td>
-                <span className="font-mono break-all">{r.missing_partner}</span>
-              </Td>
-              <Td>{r.score}</Td>
-            </tr>
-          ))}
-        </tbody>
-      </table>
-    </div>
-  );
-}
-
-function ReviewersTable({ rows }: { rows: ReviewerEntry[] }) {
-  return (
-    <div className="overflow-x-auto">
-      <table className="w-full">
-        <thead>
-          <tr>
-            <Th>Email</Th>
-            <Th>Files Owned</Th>
-            <Th>Avg Ownership %</Th>
-          </tr>
-        </thead>
-        <tbody>
-          {rows.map((r) => (
-            <tr key={r.email} className="border-t border-[var(--color-border-default)]">
-              <Td>{r.email}</Td>
-              <Td>{r.files}</Td>
-              <Td>{(r.ownership_pct * 100).toFixed(1)}%</Td>
-            </tr>
-          ))}
-        </tbody>
-      </table>
-    </div>
-  );
-}
-
-function TestGapsList({ gaps }: { gaps: string[] }) {
-  return (
-    <ul className="space-y-1">
-      {gaps.map((g) => (
-        <li key={g} className="text-xs font-mono text-[var(--color-text-secondary)] break-all">
-          {g}
-        </li>
-      ))}
-    </ul>
-  );
-}
-
-// ---------------------------------------------------------------------------
-// Page
-// ---------------------------------------------------------------------------
+import { RoutedToRiskBanner } from "@/components/risk/routed-to-risk-banner";
+import { Button } from "@repowise-dev/ui/ui/button";
+import { Card, CardHeader, CardTitle, CardContent } from "@repowise-dev/ui/ui/card";
+import { Skeleton } from "@repowise-dev/ui/ui/skeleton";
+import { BlastRadiusResults } from "@repowise-dev/ui/blast-radius";
+import { ReviewerSuggestions } from "@repowise-dev/ui/git/reviewer-suggestions";
+import type { BlastRadiusResponse } from "@repowise-dev/types/blast-radius";
+import { analyzeBlastRadius } from "@/lib/api/blast-radius";
+import { getHotspots, getReviewerSuggestions } from "@/lib/api/git";
+import { useRouter } from "next/navigation";
 
 export default function BlastRadiusPage() {
   const params = useParams<{ id: string }>();
@@ -230,10 +24,23 @@ export default function BlastRadiusPage() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [result, setResult] = useState<BlastRadiusResponse | null>(null);
+  const [analyzedPaths, setAnalyzedPaths] = useState<string[]>([]);
+  const router = useRouter();
+
+  // Reviewer suggestions key off the *most recently analyzed* paths so the
+  // panel updates the moment the analyze button is hit.
+  const reviewerKey = analyzedPaths.length
+    ? `reviewer-suggestions:${repoId}:${analyzedPaths.join(",")}`
+    : null;
+  const { data: reviewerResp, isLoading: reviewerLoading } = useSWR(
+    reviewerKey,
+    () => getReviewerSuggestions(repoId, analyzedPaths),
+    { revalidateOnFocus: false },
+  );
 
   // Suggestions: top 8 hotspots so users can prefill with one click instead
   // of remembering paths. Falls back gracefully if the call fails.
-  const { data: hotspotSuggestions } = useSWR(
+  const { data: hotspotSuggestions, isLoading: hotspotSuggestionsLoading } = useSWR(
     repoId ? ["blast-radius-suggestions", repoId] : null,
     () => getHotspots(repoId, 8),
   );
@@ -274,6 +81,7 @@ export default function BlastRadiusPage() {
         max_depth: maxDepth,
       });
       setResult(data);
+      setAnalyzedPaths(changedFiles);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Analysis failed.");
     } finally {
@@ -283,6 +91,7 @@ export default function BlastRadiusPage() {
 
   return (
     <div className="p-4 sm:p-6 space-y-6 max-w-[1600px]">
+      <RoutedToRiskBanner repoId={repoId} tab="impact" tabLabel="Impact analyzer" />
       {/* Header */}
       <div>
         <h1 className="text-xl font-semibold text-[var(--color-text-primary)] mb-1 flex items-center gap-2">
@@ -315,6 +124,14 @@ export default function BlastRadiusPage() {
             .
           </p>
 
+          {hotspotSuggestionsLoading && !hotspotSuggestions && (
+            <div className="flex flex-wrap gap-2">
+              {Array.from({ length: 6 }).map((_, i) => (
+                <Skeleton key={i} className="h-7 w-32 rounded-full" />
+              ))}
+            </div>
+          )}
+
           {hotspotSuggestions && hotspotSuggestions.length > 0 && (
             <div className="flex flex-wrap gap-2">
               {hotspotSuggestions.map((h) => (
@@ -323,7 +140,8 @@ export default function BlastRadiusPage() {
                   type="button"
                   onClick={() => addSuggestion(h.file_path)}
                   className="inline-flex items-center gap-1 rounded-full border border-[var(--color-border-default)] bg-[var(--color-bg-elevated)] px-2.5 py-1 text-[11px] font-mono text-[var(--color-text-secondary)] hover:border-[var(--color-accent-primary)] hover:text-[var(--color-text-primary)] transition-colors"
-                  title={`Add ${h.file_path}`}
+                  title={h.file_path}
+                  aria-label={`Add ${h.file_path} to changed files`}
                 >
                   <Flame className="h-3 w-3 text-orange-500" />
                   <span className="truncate max-w-[260px]">{h.file_path}</span>
@@ -333,11 +151,16 @@ export default function BlastRadiusPage() {
             </div>
           )}
 
+          <label htmlFor="blast-radius-changed-files" className="sr-only">
+            Changed file paths, one per line
+          </label>
           <textarea
+            id="blast-radius-changed-files"
             className="w-full rounded-md border border-[var(--color-border-default)] bg-[var(--color-bg-elevated)] px-3 py-2 text-xs font-mono text-[var(--color-text-primary)] placeholder:text-[var(--color-text-tertiary)] focus:outline-none focus:ring-1 focus:ring-[var(--color-accent-primary)] resize-y min-h-[120px]"
             placeholder={"src/auth/login.py\nsrc/models/user.py\n..."}
             value={files}
             onChange={(e) => setFiles(e.target.value)}
+            aria-label="Changed file paths, one per line"
           />
           <div className="flex items-center gap-4 flex-wrap">
             <label className="flex items-center gap-2 text-xs text-[var(--color-text-secondary)]">
@@ -349,6 +172,7 @@ export default function BlastRadiusPage() {
                 value={maxDepth}
                 onChange={(e) => setMaxDepth(Math.max(1, Math.min(10, Number(e.target.value))))}
                 className="w-16 rounded-md border border-[var(--color-border-default)] bg-[var(--color-bg-elevated)] px-2 py-1 text-xs text-[var(--color-text-primary)] focus:outline-none focus:ring-1 focus:ring-[var(--color-accent-primary)]"
+                aria-label="Maximum dependency depth (1–10)"
               />
             </label>
             <Button onClick={handleAnalyze} disabled={loading} size="sm">
@@ -360,68 +184,26 @@ export default function BlastRadiusPage() {
               </Button>
             )}
           </div>
-          {error && (
-            <p className="text-xs text-red-500">{error}</p>
-          )}
+          {error && <p className="text-xs text-red-500">{error}</p>}
         </CardContent>
       </Card>
 
-      {/* Results */}
       {result && (
-        <div className="space-y-4">
-          {/* Risk gauge + stats row */}
-          <div className="grid grid-cols-1 gap-4 sm:grid-cols-4">
-            <RiskScoreCard score={result.overall_risk_score} />
-            <Card className="sm:col-span-3">
-              <CardHeader className="pb-3">
-                <CardTitle className="text-sm">Summary</CardTitle>
-              </CardHeader>
-              <CardContent className="pt-0 grid grid-cols-2 sm:grid-cols-4 gap-4">
-                {[
-                  { label: "Direct Risks", value: result.direct_risks.length },
-                  { label: "Transitive Files", value: result.transitive_affected.length },
-                  { label: "Co-change Warnings", value: result.cochange_warnings.length },
-                  { label: "Test Gaps", value: result.test_gaps.length },
-                ].map(({ label, value }) => (
-                  <div key={label} className="space-y-1">
-                    <p className="text-2xl font-bold text-[var(--color-text-primary)] tabular-nums">
-                      {value}
-                    </p>
-                    <p className="text-xs text-[var(--color-text-tertiary)]">{label}</p>
-                  </div>
-                ))}
-              </CardContent>
-            </Card>
+        <div className="grid gap-4 lg:grid-cols-3">
+          <div className="lg:col-span-2 space-y-4">
+            <BlastRadiusResults result={result} />
           </div>
-
-          <TableSection title="Direct Risks" empty={result.direct_risks.length === 0}>
-            <DirectRisksTable rows={result.direct_risks} />
-          </TableSection>
-
-          <TableSection
-            title="Transitive Affected Files"
-            empty={result.transitive_affected.length === 0}
-          >
-            <TransitiveTable rows={result.transitive_affected} />
-          </TableSection>
-
-          <TableSection
-            title="Co-change Warnings"
-            empty={result.cochange_warnings.length === 0}
-          >
-            <CochangeTable rows={result.cochange_warnings} />
-          </TableSection>
-
-          <TableSection
-            title="Recommended Reviewers"
-            empty={result.recommended_reviewers.length === 0}
-          >
-            <ReviewersTable rows={result.recommended_reviewers} />
-          </TableSection>
-
-          <TableSection title="Test Gaps" empty={result.test_gaps.length === 0}>
-            <TestGapsList gaps={result.test_gaps} />
-          </TableSection>
+          <div className="space-y-4">
+            <ReviewerSuggestions
+              suggestions={reviewerResp?.suggestions ?? []}
+              isLoading={reviewerLoading}
+              subtitle={`Based on git history of ${analyzedPaths.length} touched ${analyzedPaths.length === 1 ? "path" : "paths"}.`}
+              onSelect={(s) => {
+                const k = s.email ?? `name:${s.name}`;
+                router.push(`/repos/${repoId}/owners/${encodeURIComponent(k)}`);
+              }}
+            />
+          </div>
         </div>
       )}
     </div>

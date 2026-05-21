@@ -15,13 +15,14 @@ import { listJobs } from "@/lib/api/jobs";
 import { getGitSummary } from "@/lib/api/git";
 import { getWorkspace } from "@/lib/api/workspace";
 import type { RepoStatsResponse, GitSummaryResponse } from "@/lib/api/types";
-import { StatCard } from "@/components/shared/stat-card";
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
-import { Badge } from "@/components/ui/badge";
-import { ConfidenceBadge } from "@/components/wiki/confidence-badge";
-import { EmptyState } from "@/components/shared/empty-state";
-import { formatRelativeTime, formatNumber } from "@/lib/utils/format";
-import { scoreToStatus } from "@/lib/utils/confidence";
+import { StatCard } from "@repowise-dev/ui/shared/stat-card";
+import { Card, CardContent, CardHeader, CardTitle } from "@repowise-dev/ui/ui/card";
+import { Badge } from "@repowise-dev/ui/ui/badge";
+import { ConfidenceBadge } from "@repowise-dev/ui/wiki/confidence-badge";
+import { EmptyState } from "@repowise-dev/ui/shared/empty-state";
+import { formatRelativeTime, formatNumber } from "@repowise-dev/ui/lib/format";
+import { scoreToStatus } from "@repowise-dev/ui/lib/confidence";
+import { DeleteRepoButton } from "@/components/repos/delete-repo-button";
 
 export const metadata: Metadata = { title: "Dashboard" };
 
@@ -132,48 +133,51 @@ export default async function DashboardPage() {
             ) : (
               <ul className="divide-y divide-[var(--color-border-default)]">
                 {repoList.map((repo) => (
-                  <li key={repo.id}>
-                    <Link
-                      href={`/repos/${repo.id}`}
-                      className="flex items-start gap-3 px-6 py-3.5 transition-colors hover:bg-[var(--color-bg-elevated)] group"
-                    >
-                      <div className="mt-0.5 h-2 w-2 rounded-full bg-[var(--color-accent-primary)] shrink-0" />
-                      <div className="flex-1 min-w-0">
-                        <div className="flex items-center gap-2">
-                          <p className="text-sm font-medium text-[var(--color-text-primary)] truncate group-hover:text-[var(--color-accent-primary)] transition-colors">
-                            {repo.name}
-                          </p>
-                        </div>
-                        <div className="flex items-center gap-2 mt-0.5">
-                          <p className="text-xs text-[var(--color-text-tertiary)] font-mono truncate" title={repo.local_path}>
-                            {repo.local_path}
-                          </p>
-                        </div>
-                        <div className="flex items-center gap-2 mt-1 flex-wrap">
-                          {repo.head_commit && (
-                            <span className="text-xs font-mono text-[var(--color-text-tertiary)]">
-                              {repo.head_commit.slice(0, 7)}
+                  <li key={repo.id} className="group">
+                    <div className="flex items-start gap-3 px-6 py-3.5 transition-colors hover:bg-[var(--color-bg-elevated)]">
+                      <Link
+                        href={`/repos/${repo.id}`}
+                        className="flex items-start gap-3 flex-1 min-w-0"
+                      >
+                        <div className="mt-0.5 h-2 w-2 rounded-full bg-[var(--color-accent-primary)] shrink-0" />
+                        <div className="flex-1 min-w-0">
+                          <div className="flex items-center gap-2">
+                            <p className="text-sm font-medium text-[var(--color-text-primary)] truncate group-hover:text-[var(--color-accent-primary)] transition-colors">
+                              {repo.name}
+                            </p>
+                          </div>
+                          <div className="flex items-center gap-2 mt-0.5">
+                            <p className="text-xs text-[var(--color-text-tertiary)] font-mono truncate" title={repo.local_path}>
+                              {repo.local_path}
+                            </p>
+                          </div>
+                          <div className="flex items-center gap-2 mt-1 flex-wrap">
+                            {repo.head_commit && (
+                              <span className="text-xs font-mono text-[var(--color-text-tertiary)]">
+                                {repo.head_commit.slice(0, 7)}
+                              </span>
+                            )}
+                            <span className="text-xs text-[var(--color-text-tertiary)]">
+                              Updated {formatRelativeTime(repo.updated_at)}
                             </span>
-                          )}
-                          <span className="text-xs text-[var(--color-text-tertiary)]">
-                            Updated {formatRelativeTime(repo.updated_at)}
-                          </span>
-                          {gitMap.has(repo.id) && (() => {
-                            const g = gitMap.get(repo.id)!;
-                            return (
-                              <>
-                                {g.hotspot_count > 0 && (
-                                  <Badge variant="outdated">{g.hotspot_count} hotspot{g.hotspot_count !== 1 ? "s" : ""}</Badge>
-                                )}
-                                {g.stable_count > 0 && (
-                                  <Badge variant="fresh">{g.stable_count} stable</Badge>
-                                )}
-                              </>
-                            );
-                          })()}
+                            {gitMap.has(repo.id) && (() => {
+                              const g = gitMap.get(repo.id)!;
+                              return (
+                                <>
+                                  {g.hotspot_count > 0 && (
+                                    <Badge variant="outdated">{g.hotspot_count} hotspot{g.hotspot_count !== 1 ? "s" : ""}</Badge>
+                                  )}
+                                  {g.stable_count > 0 && (
+                                    <Badge variant="fresh">{g.stable_count} stable</Badge>
+                                  )}
+                                </>
+                              );
+                            })()}
+                          </div>
                         </div>
-                      </div>
-                    </Link>
+                      </Link>
+                      <DeleteRepoButton repoId={repo.id} repoName={repo.name} />
+                    </div>
                   </li>
                 ))}
               </ul>
@@ -198,10 +202,11 @@ export default async function DashboardPage() {
             ) : (
               <ul className="divide-y divide-[var(--color-border-default)]">
                 {jobList.map((job) => (
-                  <li
-                    key={job.id}
-                    className="flex items-center gap-3 px-6 py-3"
-                  >
+                  <li key={job.id}>
+                    <Link
+                      href={`/repos/${job.repository_id}/overview`}
+                      className="flex items-center gap-3 px-6 py-3 hover:bg-[var(--color-bg-elevated)] transition-colors"
+                    >
                     <JobStatusIcon status={job.status} />
                     <div className="flex-1 min-w-0">
                       <div className="flex items-center gap-2">
@@ -232,6 +237,7 @@ export default async function DashboardPage() {
                         {job.model_name} · {formatRelativeTime(job.updated_at)}
                       </p>
                     </div>
+                    </Link>
                   </li>
                 ))}
               </ul>

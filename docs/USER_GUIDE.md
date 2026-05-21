@@ -71,6 +71,17 @@ repowise --version
 repowise --help
 ```
 
+### From Source with uv
+
+For local development, use the workspace lockfile from the repository root:
+
+```bash
+git clone https://github.com/repowise-dev/repowise.git
+cd repowise
+uv sync --all-packages
+uv run repowise --version
+```
+
 ---
 
 ## Getting Started
@@ -151,7 +162,7 @@ repowise init [PATH]
 
 | Flag | Description |
 |------|-------------|
-| `--provider` | LLM provider: `anthropic`, `openai`, `gemini`, `ollama`, `mock`. Auto-detected from env vars if not set. |
+| `--provider` | LLM provider: `anthropic`, `openai`, `openrouter`, `gemini`, `deepseek`, `ollama`, `litellm`, `mock`. Auto-detected from env vars if not set. |
 | `--model` | Model name override (e.g., `claude-sonnet-4-6`, `gpt-5.4-nano`) |
 | `--embedder` | Embedder for semantic search: `gemini`, `openai`, `mock`. Auto-detected from env vars. |
 | `--index-only` | Skip LLM generation entirely. Only parse, build graph, and index git. Free. |
@@ -161,6 +172,7 @@ repowise init [PATH]
 | `--skip-infra` | Exclude infrastructure files (Dockerfiles, Makefiles, Terraform, shell scripts). |
 | `--exclude / -x` | Gitignore-style exclusion patterns. Repeatable: `-x vendor/ -x "*.generated.*"` |
 | `--concurrency` | Max concurrent LLM calls (default: 5). Higher = faster but more API pressure. |
+| `--reasoning` | Reasoning mode for supported providers: `auto`, `off`, or `minimal` (default: `auto`). |
 | `--resume` | Resume from the last checkpoint if a previous run was interrupted. |
 | `--force` | Regenerate all pages even if they already exist. |
 | `--commit-limit` | Max commits to analyze per file (default: 500, max: 5000). Saved to config. |
@@ -185,6 +197,9 @@ repowise init --provider openai --dry-run
 
 # Quick test with 10 files
 repowise init --provider gemini --test-run
+
+# OpenRouter with minimal reasoning effort
+repowise init --provider openrouter --model openai/gpt-5 --reasoning minimal
 
 # Exclude vendor and generated code
 repowise init -x vendor/ -x "*.gen.go" -x "**/__generated__/**"
@@ -217,6 +232,7 @@ Much faster and cheaper than a full `init` — only regenerates pages for change
 | `--provider` | Override LLM provider for this run |
 | `--model` | Override model |
 | `--since` | Git ref to diff from (overrides `state.json`). Example: `--since v1.0.0` |
+| `--reasoning` | Reasoning mode for supported providers: `auto`, `off`, or `minimal`. |
 | `--cascade-budget` | Max pages to regenerate per run (default: 30). Prevents runaway regeneration. |
 | `--dry-run` | Show what would be updated without regenerating. |
 
@@ -235,6 +251,9 @@ repowise update --since v2.0.0
 
 # Limit regeneration scope
 repowise update --cascade-budget 10
+
+# Disable reasoning for a supported provider/model for this run
+repowise update --reasoning off
 ```
 
 ---
@@ -832,12 +851,13 @@ Hooks are written to `~/.claude/settings.json` automatically during `repowise in
 | `PreToolUse` | `Grep\|Glob` | Query `wiki.db` and prepend graph context to the result |
 | `PostToolUse` | `Bash` | Check for git operations and notify if wiki is stale |
 
-Both hooks call the `repowise augment` CLI command internally. Hooks are designed for graceful failure — any error results in a silent exit so a repowise issue never breaks the agent.
+Both hooks call the `repowise-augment` console script — a standalone, import-isolated entry point that does not load the full `repowise` CLI. This keeps cold start under the 500ms target and ensures a broken environment (missing optional dep, corrupt DB, etc.) never crashes the agent: any failure exits 0 silently. The equivalent `repowise augment` Click subcommand still exists for manual debugging.
 
 ### CLI command
 
 ```bash
-repowise augment    # Not meant to be called manually — invoked by Claude Code hooks
+repowise-augment    # Not meant to be called manually — invoked by Claude Code hooks
+repowise augment    # Equivalent Click subcommand, useful for manual debugging
 ```
 
 ### Sample enrichment output
@@ -903,8 +923,14 @@ repowise watch --workspace           # all workspace repos
 | Variable | Required | Description |
 |----------|----------|-------------|
 | `ANTHROPIC_API_KEY` | If using Anthropic | Anthropic API key |
+| `ANTHROPIC_BASE_URL` | No | Base URL override for Anthropic-compatible APIs |
 | `OPENAI_API_KEY` | If using OpenAI | OpenAI API key |
+| `OPENAI_BASE_URL` | No | Base URL override for OpenAI-compatible APIs |
 | `GEMINI_API_KEY` | If using Gemini | Google Gemini API key |
+| `GEMINI_BASE_URL` | No | Base URL override for Gemini-compatible APIs |
+| `OLLAMA_BASE_URL` | If using Ollama | Ollama server URL (default: `http://localhost:11434`) |
+| `LITELLM_BASE_URL` | No | Base URL override for LiteLLM proxy |
+| `LITELLM_API_BASE` | No | LiteLLM base URL alias (same as `LITELLM_BASE_URL`) |
 | `REPOWISE_DB_URL` | No | Database URL override (default: `.repowise/wiki.db`) |
 | `REPOWISE_EMBEDDER` | No | Embedder for semantic search: `gemini`, `openai`, `mock` |
 | `REPOWISE_API_URL` | Frontend only | Backend URL for the web UI (default: `http://localhost:7337`) |

@@ -3,15 +3,19 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
 import pytest
 
 from repowise.cli.helpers import (
+    CONFIG_FILENAME,
     ensure_repowise_dir,
     get_db_url_for_repo,
     get_head_commit,
     get_repowise_dir,
     load_state,
+    resolve_provider,
+    resolve_reasoning,
     resolve_repo_path,
     run_async,
     save_state,
@@ -97,6 +101,20 @@ class TestDbUrl:
         assert (tmp_path / ".repowise").exists()
 
 
+class TestResolveReasoning:
+    def test_flag_wins_over_env(self, monkeypatch):
+        monkeypatch.setenv("REPOWISE_REASONING", "minimal")
+        assert resolve_reasoning("off", {"reasoning": "auto"}) == "off"
+
+    def test_env_wins_over_config(self, monkeypatch):
+        monkeypatch.setenv("REPOWISE_REASONING", "minimal")
+        assert resolve_reasoning(config={"reasoning": "off"}) == "minimal"
+
+    def test_config_wins_over_default(self, monkeypatch):
+        monkeypatch.delenv("REPOWISE_REASONING", raising=False)
+        assert resolve_reasoning(config={"reasoning": "off"}) == "off"
+
+
 # ---------------------------------------------------------------------------
 # State file
 # ---------------------------------------------------------------------------
@@ -117,6 +135,72 @@ class TestStateFile:
     def test_save_creates_repowise_dir(self, tmp_path):
         save_state(tmp_path, {"key": "value"})
         assert (tmp_path / ".repowise" / "state.json").exists()
+
+
+# ---------------------------------------------------------------------------
+# Update lock
+# ---------------------------------------------------------------------------
+
+
+class TestUpdateLock:
+    def test_acquire_writes_payload(self, tmp_path):
+        from repowise.cli.helpers import acquire_update_lock, read_update_lock
+
+        acquire_update_lock(tmp_path, "abc123def")
+        payload = read_update_lock(tmp_path)
+        assert payload is not None
+        assert payload["target_commit"] == "abc123def"
+        assert isinstance(payload["pid"], int)
+        assert isinstance(payload["started_at"], (int, float))
+
+    def test_release_removes_lock(self, tmp_path):
+        from repowise.cli.helpers import (
+            acquire_update_lock,
+            read_update_lock,
+            release_update_lock,
+        )
+
+        acquire_update_lock(tmp_path, "abc")
+        release_update_lock(tmp_path)
+        assert read_update_lock(tmp_path) is None
+
+    def test_release_is_idempotent(self, tmp_path):
+        from repowise.cli.helpers import release_update_lock
+
+        # Should not raise even when no lock exists.
+        release_update_lock(tmp_path)
+        release_update_lock(tmp_path)
+
+    def test_read_returns_none_when_stale(self, tmp_path):
+        import json
+
+        from repowise.cli.helpers import (
+            UPDATE_LOCK_FILENAME,
+            ensure_repowise_dir,
+            read_update_lock,
+        )
+
+        ensure_repowise_dir(tmp_path)
+        lock_path = tmp_path / ".repowise" / UPDATE_LOCK_FILENAME
+        # Stale: started 2 hours ago
+        lock_path.write_text(
+            json.dumps({"pid": 1, "target_commit": "x", "started_at": 0}),
+            encoding="utf-8",
+        )
+        assert read_update_lock(tmp_path) is None
+
+    def test_read_handles_corrupt_payload(self, tmp_path):
+        from repowise.cli.helpers import (
+            UPDATE_LOCK_FILENAME,
+            ensure_repowise_dir,
+            read_update_lock,
+        )
+
+        ensure_repowise_dir(tmp_path)
+        (tmp_path / ".repowise" / UPDATE_LOCK_FILENAME).write_text(
+            "not json", encoding="utf-8"
+        )
+        assert read_update_lock(tmp_path) is None
 
 
 # ---------------------------------------------------------------------------
@@ -231,3 +315,186 @@ class TestValidateProviderConfig:
         assert len(warnings) == 1
         assert "anthropic" in warnings[0]
         assert "ANTHROPIC_API_KEY" in warnings[0]
+
+
+# ---------------------------------------------------------------------------
+# Provider base_url resolution
+# ---------------------------------------------------------------------------
+
+
+class TestResolveProviderBaseUrl:
+    @staticmethod
+    def test_env_base_url_forwarded(monkeypatch, tmp_path):
+        captured: dict[str, Any] = {}
+
+        def fake_get_provider(name: str, **kwargs: Any):
+            captured["name"] = name
+            captured["kwargs"] = kwargs
+            return "provider"
+
+        monkeypatch.setattr("repowise.core.providers.get_provider", fake_get_provider)
+        monkeypatch.setattr("repowise.cli.helpers.validate_provider_config", lambda *_args, **_kw: [])
+        monkeypatch.setenv("REPOWISE_PROVIDER", "openai")
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+        monkeypatch.setenv("OPENAI_BASE_URL", "http://proxy.local")
+
+        result = resolve_provider(None, None, repo_path=tmp_path)
+
+        assert result == "provider"
+        assert captured["name"] == "openai"
+        assert captured["kwargs"].get("base_url") == "http://proxy.local"
+
+    @staticmethod
+    def test_config_base_url_used_when_env_missing(monkeypatch, tmp_path):
+        captured: dict[str, Any] = {}
+
+        def fake_get_provider(name: str, **kwargs: Any):
+            captured["name"] = name
+            captured["kwargs"] = kwargs
+            return "provider"
+
+        monkeypatch.setattr("repowise.core.providers.get_provider", fake_get_provider)
+        monkeypatch.setattr("repowise.cli.helpers.validate_provider_config", lambda *_args, **_kw: [])
+        monkeypatch.delenv("OLLAMA_BASE_URL", raising=False)
+        cfg = {
+            "provider": "ollama",
+            "model": "llama3",
+            "ollama": {"base_url": "http://ollama.local:11434"},
+        }
+        repowise_dir = ensure_repowise_dir(tmp_path)
+        config_path = repowise_dir / CONFIG_FILENAME
+
+        try:
+            import yaml  # type: ignore[import-untyped]
+        except ImportError:
+            yaml = None
+
+        if "yaml" in locals() and yaml is not None:
+            config_path.write_text(yaml.dump(cfg, default_flow_style=False, sort_keys=False), encoding="utf-8")
+        else:
+            config_path.write_text(
+                "provider: ollama\nmodel: llama3\nollama:\n  base_url: http://ollama.local:11434\n",
+                encoding="utf-8",
+            )
+
+        result = resolve_provider(None, None, repo_path=tmp_path)
+
+        assert result == "provider"
+        assert captured["name"] == "ollama"
+        assert captured["kwargs"].get("base_url") == "http://ollama.local:11434"
+
+
+# ---------------------------------------------------------------------------
+# Update queued / pending markers — coalescing primitives that prevent the
+# post-commit hook from spawning N concurrent updates on rapid-fire commits.
+# ---------------------------------------------------------------------------
+
+
+class TestUpdateQueuedMarker:
+    """The hook drops .update.queued *before* backgrounding update_cmd so the
+    augment hook can suppress its stale-wiki warning during the start-up
+    window where the real lock hasn't been acquired yet."""
+
+    def test_round_trip(self, tmp_path):
+        from repowise.cli.helpers import (
+            clear_update_queued,
+            read_update_queued,
+            write_update_queued,
+        )
+
+        write_update_queued(tmp_path, "abc123")
+        payload = read_update_queued(tmp_path)
+        assert payload is not None
+        assert payload["target_commit"] == "abc123"
+        assert isinstance(payload["queued_at"], float)
+
+        clear_update_queued(tmp_path)
+        assert read_update_queued(tmp_path) is None
+
+    def test_stale_queued_returns_none(self, tmp_path):
+        # A queued marker older than UPDATE_QUEUED_STALE_AFTER_SECONDS
+        # (5 min) is treated as crashed-hook noise and ignored.
+        import json
+
+        from repowise.cli.helpers import ensure_repowise_dir, read_update_queued
+
+        ensure_repowise_dir(tmp_path)
+        (tmp_path / ".repowise" / ".update.queued").write_text(
+            json.dumps({"target_commit": "abc", "queued_at": 0}),
+            encoding="utf-8",
+        )
+        assert read_update_queued(tmp_path) is None
+
+    def test_missing_marker_returns_none(self, tmp_path):
+        from repowise.cli.helpers import read_update_queued
+
+        assert read_update_queued(tmp_path) is None
+
+
+class TestUpdatePendingMarker:
+    """A new update_cmd run that finds an existing lock writes the latest
+    HEAD into .update.pending so the running update can roll forward to
+    it instead of stopping at a stale commit."""
+
+    def test_round_trip(self, tmp_path):
+        from repowise.cli.helpers import (
+            clear_update_pending,
+            read_update_pending,
+            write_update_pending,
+        )
+
+        write_update_pending(tmp_path, "deadbeef")
+        assert read_update_pending(tmp_path) == "deadbeef"
+
+        clear_update_pending(tmp_path)
+        assert read_update_pending(tmp_path) is None
+
+    def test_write_with_none_head_is_noop(self, tmp_path):
+        from repowise.cli.helpers import read_update_pending, write_update_pending
+
+        write_update_pending(tmp_path, None)
+        assert read_update_pending(tmp_path) is None
+
+
+class TestRotateUpdateLog:
+    """The post-commit hook appends every run's output to .update.log.
+    Without rotation it would grow unboundedly on a busy repo."""
+
+    def test_no_op_when_under_cap(self, tmp_path):
+        from repowise.cli.helpers import (
+            ensure_repowise_dir,
+            rotate_update_log_if_needed,
+            update_log_path,
+        )
+
+        ensure_repowise_dir(tmp_path)
+        path = update_log_path(tmp_path)
+        path.write_text("small log", encoding="utf-8")
+
+        rotate_update_log_if_needed(tmp_path)
+        assert path.read_text(encoding="utf-8") == "small log"
+
+    def test_truncates_when_over_cap(self, tmp_path):
+        from repowise.cli.helpers import (
+            UPDATE_LOG_KEEP_TAIL_BYTES,
+            UPDATE_LOG_MAX_BYTES,
+            ensure_repowise_dir,
+            rotate_update_log_if_needed,
+            update_log_path,
+        )
+
+        ensure_repowise_dir(tmp_path)
+        path = update_log_path(tmp_path)
+        # Build a payload comfortably over the cap with a known tail so we
+        # can assert what survives.
+        body_size = UPDATE_LOG_MAX_BYTES * 2
+        path.write_bytes(b"x" * (body_size - 20) + b"TAIL_MARKER_ZZZZ\n")
+
+        rotate_update_log_if_needed(tmp_path)
+
+        after = path.read_bytes()
+        # Capped to roughly KEEP_TAIL_BYTES + the truncation banner; far
+        # below the original size in any case.
+        assert len(after) < UPDATE_LOG_MAX_BYTES
+        assert b"TAIL_MARKER_ZZZZ" in after
+        assert after.startswith(b"... (log truncated) ...")

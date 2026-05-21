@@ -12,10 +12,10 @@ import os
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
-from fastapi import FastAPI, Request
 from repowise.core.persistence.database import (
     create_engine,
     create_session_factory,
@@ -29,8 +29,10 @@ from repowise.core.providers.embedding.base import MockEmbedder
 from repowise.server import __version__
 from repowise.server.routers import (
     blast_radius,
+    c4,
     chat,
     claude_md,
+    code_health,
     costs,
     dead_code,
     decisions,
@@ -39,6 +41,8 @@ from repowise.server.routers import (
     health,
     jobs,
     knowledge_map,
+    modules,
+    owners,
     pages,
     providers,
     repos,
@@ -57,9 +61,10 @@ def _build_embedder():
     """Build an embedder from REPOWISE_EMBEDDER env var (default: mock).
 
     Supported values:
-        mock    — deterministic 8-dim SHA-256 embedder (default, no API key needed)
-        gemini  — GeminiEmbedder via GEMINI_API_KEY / GOOGLE_API_KEY env var
-        openai  — OpenAIEmbedder via OPENAI_API_KEY env var
+        mock       — deterministic 8-dim SHA-256 embedder (default, no API key needed)
+        gemini     — GeminiEmbedder via GEMINI_API_KEY / GOOGLE_API_KEY env var
+        openai     — OpenAIEmbedder via OPENAI_API_KEY env var
+        openrouter — OpenRouterEmbedder via OPENROUTER_API_KEY env var
     """
     name = os.environ.get("REPOWISE_EMBEDDER", "mock").lower()
     if name == "gemini":
@@ -72,7 +77,12 @@ def _build_embedder():
 
         model = os.environ.get("REPOWISE_EMBEDDING_MODEL", "text-embedding-3-small")
         return OpenAIEmbedder(model=model)
-    logger.warning("embedder.mock_active — set REPOWISE_EMBEDDER=gemini or openai for real RAG")
+    if name == "openrouter":
+        from repowise.core.providers.embedding.openrouter import OpenRouterEmbedder
+
+        model = os.environ.get("REPOWISE_EMBEDDING_MODEL", "google/gemini-embedding-001")
+        return OpenRouterEmbedder(model=model)
+    logger.warning("embedder.mock_active — set REPOWISE_EMBEDDER=gemini, openai, or openrouter for real RAG")
     return MockEmbedder()
 
 
@@ -88,8 +98,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     db_url = resolve_db_url()
     if not os.environ.get("REPOWISE_DB_URL") and not os.environ.get("REPOWISE_DATABASE_URL"):
         try:
-            from pathlib import Path as _WsPath
-            from repowise.core.workspace.config import find_workspace_root, WorkspaceConfig
+            from repowise.core.workspace.config import WorkspaceConfig, find_workspace_root
 
             _ws_root = find_workspace_root()
             if _ws_root is not None:
@@ -107,19 +116,24 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     await init_db(engine)
     session_factory = create_session_factory(engine)
 
-    # Reset any jobs left in "running" state from a previous server instance
-    # (crash or restart) — they can never complete now.
+    # Reset any jobs left in "running" or "pending" state from a previous
+    # server instance (crash, restart, or cancellation between row-insert and
+    # background-task launch) — they can never complete now and would block
+    # new syncs via the active-job guard in the repos router.
     # Note: with multi-worker deployments this is a best-effort race; the
     # try/except prevents a SQLite lock error from crashing startup.
     try:
+        from datetime import UTC as _UTC
+        from datetime import datetime
+
         from sqlalchemy import update as sa_update
+
         from repowise.core.persistence.models import GenerationJob
-        from datetime import datetime, UTC as _UTC
 
         async with get_session(session_factory) as session:
             stale_result = await session.execute(
                 sa_update(GenerationJob)
-                .where(GenerationJob.status == "running")
+                .where(GenerationJob.status.in_(["running", "pending"]))
                 .values(
                     status="failed",
                     error_message="Server restarted — job interrupted",
@@ -166,6 +180,13 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     app.state.cross_repo_enricher = None
     app.state.workspace_sessions = {}   # repo_id → session_factory
     app.state.workspace_engines = []    # engines to dispose on shutdown
+    # Per-repo FTS instances keyed by repo_id, used by the search router
+    # to fan out across every workspace repo (single-repo FTS lives on
+    # app.state.fts and stays as the primary).
+    app.state.workspace_fts = {}        # repo_id → FullTextSearch
+    # repo_id → vector store (LanceDB-backed) for per-repo semantic search.
+    # Populated lazily by the search router on first use, then cached.
+    app.state.workspace_vector_stores = {}  # repo_id → VectorStore
 
     try:
         from pathlib import Path as _Path
@@ -203,9 +224,12 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
                     continue
 
                 # Skip if this is the primary DB we already connected to
-                # (the main engine already serves this repo)
+                # (the main engine already serves this repo) — but still
+                # register the primary's FTS under its repo_id so the
+                # search fan-out can include it.
                 db_url_posix = repo_db.as_posix()
                 if db_url and db_url_posix in db_url.replace("\\", "/"):
+                    app.state.workspace_fts[repo_id] = fts
                     continue
 
                 repo_engine = create_engine(f"sqlite+aiosqlite:///{db_url_posix}")
@@ -213,6 +237,20 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
                 repo_sf = create_session_factory(repo_engine)
                 app.state.workspace_sessions[repo_id] = repo_sf
                 app.state.workspace_engines.append(repo_engine)
+
+                # Build a per-repo FTS instance so the search router can
+                # fan out queries across every workspace repo. Without
+                # this, full-text search only ever sees the primary DB.
+                try:
+                    repo_fts = FullTextSearch(repo_engine)
+                    await repo_fts.ensure_index()
+                    app.state.workspace_fts[repo_id] = repo_fts
+                except Exception:
+                    logger.debug(
+                        "workspace_fts_init_failed",
+                        extra={"repo_id": repo_id},
+                        exc_info=True,
+                    )
 
             if app.state.workspace_sessions:
                 logger.info(
@@ -247,6 +285,13 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     # Shutdown
     scheduler.shutdown(wait=False)
     await vector_store.close()
+    # Close cached per-repo vector stores (LanceDB connections).
+    try:
+        from repowise.server.search_helpers import close_workspace_vector_stores
+
+        await close_workspace_vector_stores(app)
+    except Exception:
+        logger.debug("workspace_vector_store_close_failed", exc_info=True)
     # Dispose workspace repo engines first
     for ws_engine in getattr(app.state, "workspace_engines", []):
         try:
@@ -292,9 +337,11 @@ def create_app() -> FastAPI:
     app.include_router(jobs.router)
     app.include_router(symbols.router)
     app.include_router(graph.router)
+    app.include_router(c4.router)
     app.include_router(webhooks.router)
     app.include_router(git.router)
     app.include_router(dead_code.router)
+    app.include_router(code_health.router)
     app.include_router(claude_md.router)
     app.include_router(decisions.router)
     app.include_router(chat.router)
@@ -304,5 +351,7 @@ def create_app() -> FastAPI:
     app.include_router(blast_radius.router)
     app.include_router(knowledge_map.router)
     app.include_router(workspace.router)
+    app.include_router(owners.router)
+    app.include_router(modules.router)
 
     return app

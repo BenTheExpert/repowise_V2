@@ -19,6 +19,7 @@ from repowise.server.mcp_server._helpers import (
     _resolve_all_contexts,
     _resolve_repo_context,
 )
+from repowise.server.mcp_server._meta import build_meta as _build_meta
 from repowise.server.mcp_server._server import mcp
 
 
@@ -38,11 +39,13 @@ async def get_dead_code(
     no_unreachable: bool = False,
     no_unused_exports: bool = False,
 ) -> dict:
-    """Get a tiered refactor plan for dead and unused code.
+    """Unused exports, unreachable files, zombie packages — what grep cannot tell you.
 
-    Returns findings organized into confidence tiers (high/medium/low),
-    with per-directory rollups, ownership hotspots, and impact estimates
-    so you can prioritize cleanup.
+    Static reachability analysis the agent cannot derive from imports alone.
+    Returns findings tiered by confidence (high = zero refs; medium = likely
+    unused; low = check first) with per-directory and per-owner rollups so a
+    cleanup sprint can prioritise. In workspace mode, cross-repo consumer
+    detection lowers confidence on findings that other repos import.
 
     Use group_by="directory" for a directory-level overview, or
     group_by="owner" to see who owns the most dead code. Use tier
@@ -70,7 +73,9 @@ async def get_dead_code(
         min_confidence: Minimum confidence threshold (default 0.5). Use 0.7 for high-confidence
             cleanups only.
         safe_only: Only return findings marked safe_to_delete (default false).
-        limit: Maximum findings per tier (default 20).
+        limit: Maximum findings per tier (default 20). Clamped to 25 because larger
+            payloads exceed MCP transport token caps; paginate by tier/directory/owner
+            for deeper exploration.
         tier: Focus on a single tier: "high" (>=0.8), "medium" (0.5-0.8), or "low" (<0.5).
         directory: Filter findings to a specific directory prefix.
         owner: Filter findings by primary owner name.
@@ -82,6 +87,14 @@ async def get_dead_code(
         no_unreachable: Suppress unreachable-file findings (default false).
         no_unused_exports: Suppress unused-export findings (default false).
     """
+    # MCP transport rejects payloads above ~25k tokens. A single serialized
+    # finding is ~400 chars, so 3 tiers x ~25 findings keeps us under budget
+    # with headroom for summary/grouping fields.
+    _MAX_PER_TIER = 25
+    requested_limit = limit
+    limit = min(max(limit, 1), _MAX_PER_TIER)
+    limit_clamped = requested_limit > _MAX_PER_TIER
+
     # --- repo="all": aggregate dead code across all repos ---
     if repo == "all":
         contexts = await _resolve_all_contexts()
@@ -202,12 +215,20 @@ async def get_dead_code(
         # Cross-repo confidence adjustment for workspace-wide findings
         _adjust_dead_code_cross_repo(tiers, None)
 
-        return {
+        result_ws: dict[str, Any] = {
             "workspace": True,
             "summary": summary,
             "tiers": tiers,
             "impact": _compute_impact(tiers),
         }
+        if limit_clamped:
+            result_ws["limit_note"] = (
+                f"Requested limit={requested_limit} exceeded the MCP transport budget "
+                f"and was clamped to {_MAX_PER_TIER}. Use tier/directory/owner filters "
+                "or paginate to see more findings."
+            )
+        result_ws["_meta"] = _build_meta()
+        return result_ws
 
     # --- Single repo path ---
     ctx = await _resolve_repo_context(repo)
@@ -294,6 +315,14 @@ async def get_dead_code(
     # --- Impact estimate ---
     result["impact"] = _compute_impact(tiers)
 
+    if limit_clamped:
+        result["limit_note"] = (
+            f"Requested limit={requested_limit} exceeded the MCP transport budget "
+            f"and was clamped to {_MAX_PER_TIER}. Use tier/directory/owner filters "
+            "or paginate to see more findings."
+        )
+
+    result["_meta"] = _build_meta(repository=repository)
     return result
 
 

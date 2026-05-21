@@ -3,22 +3,102 @@
 from __future__ import annotations
 
 import time
+from typing import Any
 
 import click
 from rich.table import Table
 
 from repowise.cli.helpers import (
+    CommandTarget,
+    acquire_update_lock,
+    clear_update_pending,
+    clear_update_queued,
     console,
     ensure_repowise_dir,
     find_workspace_root,
     get_head_commit,
     load_config,
     load_state,
+    read_update_lock,
+    read_update_pending,
+    release_update_lock,
+    resolve_command_target,
     resolve_provider,
+    resolve_reasoning,
     resolve_repo_path,
+    rotate_update_log_if_needed,
     run_async,
     save_state,
+    write_update_pending,
 )
+
+# ---------------------------------------------------------------------------
+# Mode resolution
+# ---------------------------------------------------------------------------
+
+
+def _infer_legacy_docs_enabled(state: dict) -> bool:
+    """Infer ``docs_enabled`` for state files written before the field existed.
+
+    Pre-migration ``init`` only wrote ``provider`` / ``model`` to state when
+    docs were generated; index-only init wrote nothing past ``last_sync_commit``.
+    So absence of both fields is a reliable signal that the original run was
+    index-only and we should default new updates to index-only too — this
+    avoids surprising those users with a full LLM regen on first upgrade.
+    Full-init users keep the old default (full mode) because their state
+    has ``provider`` and ``model`` populated.
+    """
+    if state.get("provider") or state.get("model"):
+        return True
+    return False
+
+
+def _resolve_index_only_mode(
+    *,
+    index_only: bool,
+    docs_flag: bool | None,
+    state: dict,
+) -> bool:
+    """Decide whether this update should skip LLM regeneration.
+
+    Priority: explicit ``--index-only`` flag > ``--docs/--no-docs`` >
+    ``state.docs_enabled`` > inferred default from legacy state shape.
+    Encapsulated as a pure function so the post-commit hook does the right
+    thing without needing any extra knobs at install time.
+    """
+    if index_only:
+        return True
+    if docs_flag is False:
+        return True
+    if docs_flag is True:
+        return False
+    # No explicit override — read state, falling back to a shape-based
+    # inference for state files predating the docs_enabled field.
+    if "docs_enabled" in state:
+        return state["docs_enabled"] is False
+    return _infer_legacy_docs_enabled(state) is False
+
+
+async def _persist_partial_health(session: Any, repo_id: str, report: Any) -> None:
+    """Upsert health findings + metrics for the changed-files subset.
+
+    Unlike ``persist_pipeline_result`` (which delete-then-inserts the
+    whole repo), this writer only touches rows whose ``file_path`` is in
+    the partial report — so unchanged files keep their existing findings
+    and metrics across an incremental ``repowise update``.
+    """
+    from repowise.core.persistence.crud import (
+        upsert_health_findings,
+        upsert_health_metrics,
+    )
+
+    changed_paths = sorted({m.file_path for m in report.metrics or []})
+    if not changed_paths:
+        return
+    await upsert_health_metrics(session, repo_id, report.metrics or [])
+    await upsert_health_findings(
+        session, repo_id, list(report.findings or []), file_paths=changed_paths
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -27,24 +107,24 @@ from repowise.cli.helpers import (
 
 
 def _workspace_update(
-    start_path: "Path",
+    target: "CommandTarget",
     *,
-    repo_alias: str | None = None,
     dry_run: bool = False,
 ) -> None:
-    """Update stale repos in a workspace."""
-    from pathlib import Path
+    """Update stale repos in a workspace.
 
-    from repowise.core.workspace import WorkspaceConfig, check_repo_staleness, update_workspace
+    Takes a resolved :class:`CommandTarget` so the caller has full control
+    over how the workspace was located (auto-detected vs explicit flag).
+    """
+    from repowise.core.workspace import check_repo_staleness, update_workspace
 
-    ws_root = find_workspace_root(start_path)
-    if ws_root is None:
-        raise click.ClickException(
-            "No .repowise-workspace.yaml found. "
-            "Run 'repowise init <workspace-dir>' first."
-        )
-
-    ws_config = WorkspaceConfig.load(ws_root)
+    ws_root = target.ws_root
+    ws_config = target.ws_config
+    repo_alias = target.repo_filter
+    if ws_root is None or ws_config is None:
+        # Defensive: callers should always pass a workspace-mode target,
+        # but guard against misuse so the error message is clear.
+        raise click.ClickException("_workspace_update called without a workspace target.")
 
     # Show staleness summary first
     console.print(f"[bold]repowise update[/bold] — workspace: {ws_root.name}")
@@ -57,7 +137,9 @@ def _workspace_update(
         abs_path = (ws_root / entry.path).resolve()
         stored = entry.last_commit_at_index
         is_stale, head, behind = check_repo_staleness(abs_path, stored)
-        status = f"[yellow]{behind} new commit(s)[/yellow]" if is_stale else "[green]up to date[/green]"
+        status = (
+            f"[yellow]{behind} new commit(s)[/yellow]" if is_stale else "[green]up to date[/green]"
+        )
         if not (abs_path / ".repowise").is_dir():
             status = "[dim]not indexed[/dim]"
         console.print(f"  {entry.alias:<20} {status}")
@@ -81,6 +163,14 @@ def _workspace_update(
     def _on_done(result: "RepoUpdateResult") -> None:
         if result.error:
             console.print(f"    [red]\u2717 {result.alias}: {result.error}[/red]")
+        elif result.skipped_reason == "in_flight":
+            # Surface skipped-because-in-flight as a yellow note rather than
+            # a silent skip. Single-flight is the noise-fix path, so the
+            # user benefits from seeing it actually trigger.
+            console.print(
+                f"    [yellow]\u21bb {result.alias}: another update is already "
+                "in flight; this commit was queued for it to pick up.[/yellow]"
+            )
         elif result.updated:
             console.print(
                 f"    [green]\u2713[/green] {result.alias}: "
@@ -121,6 +211,13 @@ def _workspace_update(
 @click.option("--provider", "provider_name", default=None, help="LLM provider name.")
 @click.option("--model", default=None, help="Model identifier override.")
 @click.option("--since", default=None, help="Base git ref to diff from (overrides state).")
+@click.option("--concurrency", type=int, default=5, help="Max concurrent LLM calls.")
+@click.option(
+    "--reasoning",
+    type=click.Choice(["auto", "off", "minimal"]),
+    default=None,
+    help="Reasoning mode for supported providers: auto, off, or minimal.",
+)
 @click.option(
     "--cascade-budget",
     type=int,
@@ -135,34 +232,87 @@ def _workspace_update(
     "-w",
     is_flag=True,
     default=False,
-    help="Update all stale repos in the workspace.",
+    help="Force workspace mode (update all stale repos in the workspace).",
+)
+@click.option(
+    "--no-workspace",
+    is_flag=True,
+    default=False,
+    help="Force single-repo mode even when invoked from a workspace.",
 )
 @click.option(
     "--repo",
     "repo_alias",
     default=None,
-    help="Update only this repo alias within the workspace.",
+    help="Update only this repo alias within the workspace (implies --workspace).",
+)
+@click.option(
+    "--index-only",
+    is_flag=True,
+    default=False,
+    help=(
+        "Skip LLM page regeneration. Re-parses files, rebuilds the dependency "
+        "graph, and refreshes git/dead-code artifacts only. Useful for tight "
+        "iteration on extractors / resolvers without spending tokens."
+    ),
+)
+@click.option(
+    "--docs/--no-docs",
+    "docs_flag",
+    default=None,
+    help=(
+        "Override the persisted init mode for this run. --no-docs is "
+        "equivalent to --index-only; --docs forces LLM page regeneration "
+        "even when the repo was indexed without docs. Without either flag, "
+        "the value of `docs_enabled` from .repowise/state.json is used "
+        "(set during `repowise init`)."
+    ),
 )
 def update_command(
     path: str | None,
     provider_name: str | None,
     model: str | None,
     since: str | None,
+    reasoning: str | None,
     cascade_budget: int | None,
     dry_run: bool,
     workspace: bool,
+    no_workspace: bool,
     repo_alias: str | None,
+    index_only: bool = False,
+    docs_flag: bool | None = None,
+    concurrency: int = 5,
 ) -> None:
-    """Incrementally update wiki pages for files changed since last sync."""
-    start = time.monotonic()
-    repo_path = resolve_repo_path(path)
+    """Incrementally update wiki pages for files changed since last sync.
 
-    # --- Workspace mode ---
-    if workspace or repo_alias:
-        _workspace_update(repo_path, repo_alias=repo_alias, dry_run=dry_run)
+    Auto-detects workspace mode when invoked from a workspace root or when a
+    workspace exists upstream of the working directory. Use --no-workspace to
+    force single-repo mode and --workspace to force workspace mode.
+    """
+    start = time.monotonic()
+
+    # --- Resolve target up front (single repo or workspace) ---
+    target = resolve_command_target(
+        path=path,
+        workspace_flag=workspace,
+        no_workspace_flag=no_workspace,
+        repo_alias=repo_alias,
+    )
+    target.notice(console, command="update")
+
+    if target.is_workspace:
+        _workspace_update(target, dry_run=dry_run)
         return
 
+    # --- Single-repo path from here on. ---
+    repo_path = target.repo_path
+    assert repo_path is not None  # single mode always sets repo_path
     ensure_repowise_dir(repo_path)
+    # Truncate the hook-managed log if it has grown past the cap. The hook
+    # appends each run unconditionally — without this opportunistic rotation
+    # at the start of every CLI update, a busy repo's ``.update.log`` would
+    # balloon to MBs over time.
+    rotate_update_log_if_needed(repo_path)
 
     # Load saved API keys from .repowise/.env (won't overwrite existing env vars)
     from repowise.cli.ui import load_dotenv
@@ -174,13 +324,85 @@ def update_command(
     head = get_head_commit(repo_path)
 
     if base_ref is None:
+        # Helpful diagnostic when the user landed here from a workspace
+        # directory that was never indexed as a single repo. The auto-detect
+        # path normally catches this earlier, but --no-workspace or an
+        # explicit path can still route us here.
+        hint = ""
+        upstream_ws = find_workspace_root(repo_path)
+        if upstream_ws is not None:
+            hint = (
+                f"\nA workspace was detected at {upstream_ws}. "
+                "Did you mean: repowise update --workspace?"
+            )
         raise click.ClickException(
-            "No previous sync found. Run 'repowise init' first or pass --since."
+            f"No previous sync found for {repo_path}. "
+            "Run 'repowise init' there first, or pass --since <ref>." + hint
         )
 
     if head and head == base_ref:
         console.print("[green]Already up to date.[/green]")
         return
+
+    # --- Single-flight check ------------------------------------------------
+    # A fresh lock from another process means a `repowise update` is already
+    # running on this repo. Two updates racing on save_state was the actual
+    # root cause of "wiki keeps going stale": post-commit hooks fired during
+    # rapid-fire commits would each redo full ingestion + generation from the
+    # same outdated base, take 10+ minutes, then save_state out of order so
+    # state.json never reflected reality. Bail cleanly instead — and leave
+    # the new HEAD in ``.update.pending`` so the running update can roll
+    # forward to it at the end of its current pass.
+    existing_lock = read_update_lock(repo_path)
+    if existing_lock is not None:
+        import time as _time
+
+        elapsed = int(_time.time() - existing_lock.get("started_at", _time.time()))
+        target_short = (existing_lock.get("target_commit") or "")[:8]
+        write_update_pending(repo_path, head)
+        console.print(
+            f"[yellow]Another `repowise update` is already running "
+            f"(pid {existing_lock.get('pid')}, target {target_short}, "
+            f"started {elapsed}s ago).[/yellow]"
+        )
+        console.print(
+            f"[dim]HEAD {head[:8] if head else 'HEAD'} marked as pending; "
+            "the running update will roll forward to it.[/dim]"
+        )
+        return
+
+    # Backfill docs_enabled on legacy state files using the same
+    # shape-based inference the resolver uses, so the post-commit hook
+    # and future runs stop relying on the inference. Done before mode
+    # resolution and only when no explicit override was passed, so a
+    # one-off `--docs` / `--no-docs` doesn't lock anything in.
+    explicit_override = (
+        # The CLI default of index_only is False; treat it like an
+        # override only when the user actually passed the flag, which we
+        # can't distinguish here — but the conservative choice is fine:
+        # index_only=True is always treated as an override.
+        index_only or docs_flag is not None
+    )
+    if "docs_enabled" not in state and not explicit_override:
+        state["docs_enabled"] = _infer_legacy_docs_enabled(state)
+        save_state(repo_path, state)
+
+    # --- Resolve effective mode (index-only vs full LLM regen) ---
+    index_only = _resolve_index_only_mode(index_only=index_only, docs_flag=docs_flag, state=state)
+
+    # --- Acquire update lock so the augment hook can suppress its
+    # stale-wiki warning while this run is in flight (typical case: the
+    # post-commit hook fires `repowise update` in the background, then a
+    # follow-on tool call would otherwise warn that HEAD has moved). ---
+    import atexit
+
+    acquire_update_lock(repo_path, head)
+    # Drop the queued marker now that the real lock owns the suppression
+    # window. Leaving both behind would cause the augment hook to keep
+    # suppressing for the queued-stale-after duration even past a failed run.
+    clear_update_queued(repo_path)
+    atexit.register(release_update_lock, repo_path)
+    atexit.register(clear_update_queued, repo_path)
 
     console.print(f"[bold]repowise update[/bold] — {repo_path}")
     console.print(f"Diffing [cyan]{base_ref[:8]}..{(head or 'HEAD')[:8]}[/cyan]")
@@ -209,11 +431,21 @@ def update_command(
     from repowise.core.generation import ContextAssembler, GenerationConfig, PageGenerator
     from repowise.core.ingestion import ASTParser, FileTraverser, GraphBuilder
 
-    config = GenerationConfig()
+    cfg = load_config(repo_path)
+    language = cfg.get("language", "en")
+    # Config-driven (saved by `repowise init`); CLI override not surfaced
+    # on update yet — defaults to on to keep the onboarding collection
+    # fresh as the codebase evolves.
+    enable_onboarding_cfg = bool(cfg.get("enable_onboarding", True))
+    config = GenerationConfig(
+        max_concurrency=concurrency,
+        language=language,
+        reasoning=resolve_reasoning(reasoning, cfg),
+        enable_onboarding=enable_onboarding_cfg,
+    )
 
     # Read exclude patterns from config (set during init or via web UI)
-    repo_config = load_config(repo_path)
-    exclude_patterns: list[str] = list(repo_config.get("exclude_patterns") or [])
+    exclude_patterns: list[str] = list(cfg.get("exclude_patterns") or [])
 
     # Full re-ingest for graph (needed for cascade analysis)
     traverser = FileTraverser(repo_path, extra_exclude_patterns=exclude_patterns or None)
@@ -223,7 +455,7 @@ def update_command(
     parser = ASTParser()
     parsed_files = []
     source_map: dict[str, bytes] = {}
-    graph_builder = GraphBuilder()
+    graph_builder = GraphBuilder(repo_path)
 
     for fi in file_infos:
         try:
@@ -252,8 +484,8 @@ def update_command(
     try:
         from repowise.core.ingestion.git_indexer import GitIndexer
 
-        _commit_limit = repo_config.get("commit_limit")
-        _follow_renames = repo_config.get("follow_renames", False)
+        _commit_limit = cfg.get("commit_limit")
+        _follow_renames = cfg.get("follow_renames", False)
         git_indexer = GitIndexer(
             repo_path,
             commit_limit=_commit_limit,
@@ -282,22 +514,166 @@ def update_command(
         console.print("[yellow]Dry run — no pages regenerated.[/yellow]")
         return
 
-    provider = resolve_provider(provider_name, model, repo_path=repo_path)
+    # Run partial code-health analysis up front so both the index-only
+    # and full paths can upsert findings/metrics for changed files only.
+    # The full file-list is needed because duplication is cross-file —
+    # but only files in ``changed_paths`` produce new findings/metrics.
+    partial_health_report = None
+    try:
+        from repowise.core.analysis.health import HealthAnalyzer
+        from repowise.core.analysis.health.config import HealthConfig
 
-    # Run partial dead code analysis on affected files
+        _health_analyzer = HealthAnalyzer(
+            graph_builder.graph(),
+            git_meta_map=git_meta_map,
+            parsed_files=parsed_files,
+        )
+        _health_changed = {fd.path for fd in file_diffs if fd.status in ("added", "modified")}
+        if _health_changed:
+            _hcfg = HealthConfig.load(repo_path)
+            _analyzer_config = (
+                _hcfg.to_analyzer_config([pf.file_info.path for pf in parsed_files])
+                if (_hcfg.disabled_biomarkers or _hcfg.rules)
+                else None
+            )
+            partial_health_report = _health_analyzer.analyze(
+                _analyzer_config, changed_files=_health_changed
+            )
+            console.print(
+                f"Health analysis (partial): [cyan]{len(_health_changed)} files[/cyan], "
+                f"[yellow]{len(partial_health_report.findings)} findings[/yellow]"
+            )
+    except Exception as exc:
+        console.print(f"[yellow]Health analysis skipped: {exc}[/yellow]")
+
+    # Run partial dead-code analysis up front so both branches can
+    # persist its results. Previously this sat below the ``if index_only``
+    # short-circuit, which left the closure's reference to
+    # ``dead_code_report`` unbound and crashed every ``--index-only`` run.
     dead_code_report = None
     try:
         from repowise.core.analysis.dead_code import DeadCodeAnalyzer
 
-        analyzer = DeadCodeAnalyzer(graph_builder.graph(), git_meta_map)
-        changed_paths = [fd.path for fd in file_diffs]
-        dead_code_report = analyzer.analyze_partial(changed_paths)
+        _analyzer_partial = DeadCodeAnalyzer(graph_builder.graph(), git_meta_map)
+        _changed_paths_partial = [fd.path for fd in file_diffs]
+        dead_code_report = _analyzer_partial.analyze_partial(_changed_paths_partial)
         if dead_code_report.total_findings:
             console.print(
                 f"Dead code findings (partial): [yellow]{dead_code_report.total_findings}[/yellow]"
             )
     except Exception as exc:
         console.print(f"[yellow]Dead code analysis skipped: {exc}[/yellow]")
+
+    if index_only:
+        # Refresh graph, git metadata, and dead-code artifacts without
+        # paying for LLM regeneration. Persist what we already computed
+        # above and skip provider/decision/page-generation work.
+        async def _persist_index_only() -> None:
+            from repowise.cli.helpers import get_db_url_for_repo
+            from repowise.core.persistence import (
+                create_engine,
+                create_session_factory,
+                get_session,
+                init_db,
+                upsert_repository,
+            )
+
+            url = get_db_url_for_repo(repo_path)
+            engine = create_engine(url)
+            await init_db(engine)
+            sf = create_session_factory(engine)
+
+            async with get_session(sf) as session:
+                repo = await upsert_repository(
+                    session, name=repo_path.name, local_path=str(repo_path)
+                )
+                repo_id = repo.id
+
+                if git_meta_map:
+                    try:
+                        from repowise.core.persistence.crud import (
+                            recompute_git_percentiles,
+                            upsert_git_metadata_bulk,
+                        )
+
+                        await upsert_git_metadata_bulk(
+                            session, repo_id, list(git_meta_map.values())
+                        )
+                        await recompute_git_percentiles(session, repo_id)
+                    except Exception as exc:
+                        console.print(f"[yellow]Git persist skipped: {exc}[/yellow]")
+
+                if dead_code_report is not None:
+                    try:
+                        from repowise.core.persistence.crud import (
+                            save_dead_code_findings,
+                        )
+
+                        await save_dead_code_findings(session, repo_id, dead_code_report.findings)
+                    except Exception as exc:
+                        console.print(f"[yellow]Dead-code persist skipped: {exc}[/yellow]")
+
+                if partial_health_report is not None:
+                    try:
+                        await _persist_partial_health(session, repo_id, partial_health_report)
+                    except Exception as exc:
+                        console.print(f"[yellow]Health persist skipped: {exc}[/yellow]")
+
+                # Re-persist graph_nodes so symbol-level PageRank /
+                # betweenness / community ids stay in sync with the
+                # current graph build. Without this, ``repowise update``
+                # leaves stale per-symbol metrics from the original init
+                # and the UI shows "Not indexed in graph" for every
+                # symbol on existing repos.
+                try:
+                    from repowise.core.pipeline.persist import persist_graph_nodes
+
+                    await persist_graph_nodes(session, repo_id, graph_builder)
+                except Exception as exc:
+                    console.print(f"[yellow]Graph nodes persist skipped: {exc}[/yellow]")
+
+        run_async(_persist_index_only())
+        save_state(repo_path, {**state, "last_sync_commit": head})
+        elapsed = time.monotonic() - start
+        console.print(
+            f"[green]Index-only update complete[/green] in {elapsed:.1f}s — "
+            "graph + git + dead-code refreshed; LLM pages unchanged."
+        )
+        return
+
+    provider = resolve_provider(provider_name, model, repo_path=repo_path)
+
+    # Attach a DB-backed CostTracker so every LLM call made during this update
+    # (decision rescan + page regeneration) is persisted to the `llm_costs`
+    # table — matching what `repowise init` already does. Without this,
+    # `repowise costs` only ever reflects the initial index and shows $0 for
+    # all subsequent updates.
+    from repowise.cli.helpers import get_db_url_for_repo
+    from repowise.core.generation.cost_tracker import CostTracker
+    from repowise.core.persistence import (
+        create_engine,
+        create_session_factory,
+        get_session,
+        init_db,
+        upsert_repository,
+    )
+
+    async def _make_cost_tracker() -> CostTracker:
+        url = get_db_url_for_repo(repo_path)
+        engine = create_engine(url)
+        await init_db(engine)
+        sf = create_session_factory(engine)
+        async with get_session(sf) as session:
+            repo = await upsert_repository(session, name=repo_path.name, local_path=str(repo_path))
+            return CostTracker(session_factory=sf, repo_id=repo.id)
+
+    try:
+        cost_tracker = run_async(_make_cost_tracker())
+    except Exception:
+        cost_tracker = CostTracker()
+    provider._cost_tracker = cost_tracker
+
+    # (dead_code_report computed above, before the index-only branch)
 
     # Re-scan changed files for inline decision markers
     new_decision_markers: list = []
@@ -327,9 +703,35 @@ def update_command(
     affected_parsed = [pf for pf in parsed_files if pf.file_info.path in regen_set]
     affected_source = {p: s for p, s in source_map.items() if p in regen_set}
 
+    # Load prior pages so the generator can skip the LLM call for any affected
+    # file whose freshly rendered prompt still hashes to the persisted value.
+    async def _load_prior() -> dict[str, object]:
+        from repowise.cli.helpers import get_db_url_for_repo
+        from repowise.core.persistence import (
+            create_engine,
+            create_session_factory,
+            get_session,
+            load_prior_pages,
+            upsert_repository,
+        )
+
+        url = get_db_url_for_repo(repo_path)
+        engine = create_engine(url)
+        sf = create_session_factory(engine)
+        async with get_session(sf) as session:
+            repo = await upsert_repository(session, name=repo_path.name, local_path=str(repo_path))
+            return await load_prior_pages(session, repo.id)
+
+    try:
+        prior_pages = run_async(_load_prior())
+    except Exception:
+        prior_pages = {}
+
     # Generate affected pages
     assembler = ContextAssembler(config)
-    generator = PageGenerator(provider, assembler, config)
+    generator = PageGenerator(
+        provider, assembler, config, language=config.language, prior_pages=prior_pages
+    )
     repo_name = repo_path.name
 
     generated_pages = run_async(
@@ -407,6 +809,14 @@ def update_command(
         except Exception:
             pass  # never fail update due to decision processing
 
+        # Persist code-health findings + metrics (partial — upsert only)
+        if partial_health_report is not None:
+            try:
+                async with get_session(sf) as session:
+                    await _persist_partial_health(session, repo_id, partial_health_report)
+            except Exception:
+                pass  # health persistence is best-effort
+
         # Persist dead code findings (partial)
         if dead_code_report and dead_code_report.findings:
             try:
@@ -423,9 +833,23 @@ def update_command(
             except Exception:
                 pass  # dead code persistence is best-effort
 
+        # Re-persist graph_nodes so symbol-level PageRank / betweenness
+        # / community ids reflect the current build. Same rationale as
+        # the index-only branch above — without this every per-symbol
+        # metric stays at its original value forever.
+        try:
+            from repowise.core.pipeline.persist import persist_graph_nodes
+
+            async with get_session(sf) as session:
+                await persist_graph_nodes(session, repo_id, graph_builder)
+        except Exception:
+            pass  # graph node persistence is best-effort
+
         # Record a GenerationJob so the web UI "last synced" timestamp updates
         try:
-            from datetime import datetime, UTC as _UTC
+            from datetime import UTC as _UTC
+            from datetime import datetime
+
             from repowise.core.persistence.crud import upsert_generation_job
 
             async with get_session(sf) as session:
@@ -453,47 +877,29 @@ def update_command(
 
     run_async(_persist())
 
-    # ---- CLAUDE.md (best-effort) ----
-    cfg = load_config(repo_path)
-    if cfg.get("editor_files", {}).get("claude_md", True):
-        try:
-            from repowise.cli.helpers import get_db_url_for_repo
-            from repowise.core.generation.editor_files import (
-                ClaudeMdGenerator,
-                EditorFileDataFetcher,
-            )
-            from repowise.core.persistence import (
-                create_engine,
-                create_session_factory,
-                get_session,
-                init_db,
-            )
-            from repowise.core.persistence.crud import get_repository_by_path
+    # ---- Editor project files (best-effort) ----
+    try:
+        from repowise.cli.editor_setup import refresh_editor_project_files
 
-            async def _update_claude_md() -> None:
-                url = get_db_url_for_repo(repo_path)
-                engine = create_engine(url)
-                await init_db(engine)
-                sf = create_session_factory(engine)
-                try:
-                    async with get_session(sf) as session:
-                        repo_rec = await get_repository_by_path(session, str(repo_path))
-                        if repo_rec is None:
-                            return
-                        fetcher = EditorFileDataFetcher(session, repo_rec.id, repo_path)
-                        data = await fetcher.fetch()
-                finally:
-                    await engine.dispose()
-                ClaudeMdGenerator().write(repo_path, data)
-
-            run_async(_update_claude_md())
-        except Exception:
-            pass  # CLAUDE.md update must never fail the update command
+        refresh_editor_project_files(console, repo_path)
+    except Exception:
+        pass  # Editor project-file refresh must never fail the update command
 
     # Update state
     state["last_sync_commit"] = head
     state["total_pages"] = state.get("total_pages", 0) + len(generated_pages)
     save_state(repo_path, state)
+
+    # --- Roll forward to any commit that landed during this run ------------
+    # Another `repowise update` (from a post-commit hook) may have written a
+    # ``.update.pending`` marker while we were generating pages. If the new
+    # HEAD points past where we just finished, clear the marker only if it's
+    # already caught up; otherwise leave it in place as a signal to the
+    # augment hook so its message can be "update done, new commits since"
+    # instead of the bare stale-wiki warning.
+    pending_head = read_update_pending(repo_path)
+    if pending_head and pending_head == head:
+        clear_update_pending(repo_path)
 
     # Trigger cross-repo hooks if this repo is part of a workspace
     try:
@@ -505,6 +911,7 @@ def update_command(
             ws_config = WorkspaceConfig.load(ws_root)
             # Find this repo's alias in the workspace config
             from pathlib import Path as _P
+
             repo_abs = repo_path.resolve()
             alias = None
             for entry in ws_config.repos:

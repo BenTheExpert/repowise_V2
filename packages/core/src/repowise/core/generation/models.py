@@ -14,6 +14,8 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Literal
 
+from repowise.core.reasoning import ReasoningMode, normalize_reasoning
+
 # ---------------------------------------------------------------------------
 # PageType and generation levels
 # ---------------------------------------------------------------------------
@@ -24,25 +26,26 @@ PageType = Literal[
     "file_page",
     "scc_page",
     "module_page",
-    "cross_package",
     "repo_overview",
     "architecture_diagram",
     "infra_page",
-    "diff_summary",
+    # Phase 3: onboarding collection (subkind in metadata).
+    "onboarding",
 ]
 
-# Maps PageType → generation level (0 = first, 7 = last)
+# Maps PageType → generation level (0 = first, 8 = last).
+# Onboarding runs last so it can reference module/file pages already in the
+# wiki and so its prompts see the freshest signal bundle.
 GENERATION_LEVELS: dict[str, int] = {
     "api_contract": 0,
     "symbol_spotlight": 1,
     "file_page": 2,
     "scc_page": 3,
     "module_page": 4,
-    "cross_package": 5,
     "repo_overview": 6,
     "architecture_diagram": 6,
     "infra_page": 7,
-    "diff_summary": 7,
+    "onboarding": 8,
 }
 
 FreshnessStatus = Literal["fresh", "stale", "expired", "unknown"]
@@ -62,6 +65,9 @@ class GenerationConfig:
         temperature:              Sampling temperature (0.3 for consistent docs).
         token_budget:             Context tokens fed to LLM (not output).
         max_concurrency:          asyncio.Semaphore size for parallel calls.
+        embed_concurrency:        asyncio.Semaphore size for vector-store writes.
+                                  Defaults to max_concurrency.
+        reasoning:                Provider-level reasoning intent.
         cache_enabled:            In-memory SHA256 prompt deduplication.
         staleness_threshold_days: Days before a page is considered stale.
         expiry_threshold_days:    Days before a page is considered expired.
@@ -69,19 +75,69 @@ class GenerationConfig:
         jobs_dir:                 Directory for job checkpoint JSON files.
     """
 
-    max_tokens: int = 16000
+    max_tokens: int = 20000
     temperature: float = 0.3
     token_budget: int = 48000
-    max_concurrency: int = 5
+    max_concurrency: int = 12
+    embed_concurrency: int | None = None
+    reasoning: ReasoningMode = "auto"
     cache_enabled: bool = True
     staleness_threshold_days: int = 7
     expiry_threshold_days: int = 30
-    top_symbol_percentile: float = 0.10  # top N% public symbols by PageRank → symbol_spotlight
-    file_page_top_percentile: float = 0.10  # top N% code files by PageRank → file_page
-    file_page_min_symbols: int = 1  # files with fewer symbols are skipped for file_page
-    max_pages_pct: float = 0.10  # hard cap: total pages ≤ max(50, N_files * this)
+    # ---- Coverage budget (enforced by generation.selection) ----------
+    # ``coverage_pct`` is the single knob users care about: the fraction
+    # of repo files that should produce a wiki page. The selection
+    # subsystem (``generation.selection``) is the *single source of
+    # truth* — it scores every candidate, allocates the budget across
+    # buckets via the share fields below, and returns an allow-set that
+    # both page_generator and cost_estimator honor verbatim. There is
+    # no longer an absolute cap — the percentage scales linearly.
+    coverage_pct: float = 0.20
+    file_page_share: float = 0.50
+    symbol_spotlight_share: float = 0.15
+    module_page_share: float = 0.10
+    api_contract_share: float = 0.08
+    infra_page_share: float = 0.05
+    scc_share: float = 0.04
+    # ``max_pages_pct`` is kept as a deprecated alias for backwards
+    # compatibility — older tests and CLI flows still read it. The
+    # selector picks ``coverage_pct`` when set and falls back here.
+    max_pages_pct: float = 0.20
+    # Legacy percentile knobs are retained for callers that want fine
+    # control but no longer drive page selection on their own.
+    top_symbol_percentile: float = 0.20
+    file_page_top_percentile: float = 0.10
+    file_page_min_symbols: int = 1
+    skip_trivial_files: bool = True
+    dedupe_near_clones: bool = True
+    # Phase 2: switch module_page grouping from top-directory to graph
+    # communities. min_module_size is the floor below which a community
+    # doesn't get its own page (its files still appear under file_page).
+    module_grouping: Literal["community", "top_dir"] = "community"
+    min_module_size: int = 3
+    # Phase 3: emit the curated Onboarding collection at level 8. Each
+    # subkind defines its own gate; slots whose gates fail are silently
+    # skipped (no UI nav entry either).
+    enable_onboarding: bool = True
+    # When True, file_page generation runs a vector-store search (one
+    # embedder round-trip per page) to inject related-page snippets into
+    # the prompt. On cheap models the extra latency is often more costly
+    # than the marginal quality lift — turn off to skip the search.
+    # See also rag_min_store_size below for the auto-bypass on small stores.
+    enable_rag_context: bool = True
+    # RAG search is bypassed entirely until the vector store has at least
+    # this many pages. The first wave of file_page generation runs against
+    # an empty / nearly-empty store anyway, so the search is a wasted
+    # round-trip until enough content is indexed to return useful hits.
+    rag_min_store_size: int = 10
     jobs_dir: str = ".repowise/jobs"
     large_file_source_pct: float = 0.4  # use structural summary when source tokens > budget * this
+    language: str = "en"
+
+    def __post_init__(self) -> None:
+        if self.embed_concurrency is None:
+            object.__setattr__(self, "embed_concurrency", self.max_concurrency)
+        object.__setattr__(self, "reasoning", normalize_reasoning(self.reasoning))
 
 
 # ---------------------------------------------------------------------------
@@ -290,7 +346,7 @@ class DeadCodeConfig:
     enabled: bool = True
     detect_unreachable_files: bool = True
     detect_unused_exports: bool = True
-    detect_unused_internals: bool = False
+    detect_unused_internals: bool = True
     detect_zombie_packages: bool = True
     min_confidence: float = 0.4
     safe_to_delete_threshold: float = 0.7

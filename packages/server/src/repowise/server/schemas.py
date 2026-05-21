@@ -5,8 +5,29 @@ from __future__ import annotations
 import json
 from datetime import datetime
 from pathlib import Path
+from typing import Generic, TypeVar
 
 from pydantic import BaseModel, Field, field_validator
+
+# ---------------------------------------------------------------------------
+# Pagination envelope — shared across list endpoints (git, symbols, etc.)
+# ---------------------------------------------------------------------------
+
+T = TypeVar("T")
+
+
+class Paginated(BaseModel, Generic[T]):
+    """Stable envelope for paginated list endpoints.
+
+    Lets the UI show "Showing N of M / Load more" without guessing whether
+    a list was truncated by the server. `next_offset` is null when there
+    are no further pages.
+    """
+
+    items: list[T]
+    total: int
+    has_more: bool
+    next_offset: int | None = None
 
 # ---------------------------------------------------------------------------
 # Repository
@@ -50,6 +71,16 @@ class RepoResponse(BaseModel):
     settings: dict
     created_at: datetime
     updated_at: datetime
+    # Workspace context — populated when the server is running in
+    # workspace mode. ``status`` indicates whether the repo has been
+    # indexed yet; the web UI uses it to render "needs index" CTA cards
+    # instead of silently dropping unindexed workspace repos from the
+    # sidebar. Always ``None`` in single-repo mode.
+    workspace_alias: str | None = None
+    workspace_status: str | None = None
+    is_primary: bool | None = None
+    docs_enabled: bool | None = None
+    docs_skip_reason: str | None = None
 
     @classmethod
     def from_orm(cls, obj: object) -> RepoResponse:
@@ -222,6 +253,18 @@ class SearchResultResponse(BaseModel):
 # ---------------------------------------------------------------------------
 
 
+class SymbolImportanceComponents(BaseModel):
+    """Transparent breakdown of the composite importance score so the UI can
+    explain *why* a symbol ranks where it does. All fields are normalized to
+    [0, 1] except booleans."""
+
+    file_pagerank: float = 0.0
+    visibility_factor: float = 0.5
+    complexity_norm: float = 0.0
+    kind_boost: float = 1.0
+    is_entry_point: bool = False
+
+
 class SymbolResponse(BaseModel):
     id: str
     repository_id: str
@@ -239,6 +282,14 @@ class SymbolResponse(BaseModel):
     complexity_estimate: int
     language: str
     parent_name: str | None
+    # Importance signals (populated when the list endpoint joins GraphNode /
+    # GitMetadata; nullable so single-symbol lookups remain lightweight).
+    importance_score: float | None = None
+    importance_components: SymbolImportanceComponents | None = None
+    file_pagerank: float | None = None
+    is_entry_point: bool | None = None
+    file_churn_percentile: float | None = None
+    file_is_hotspot: bool | None = None
 
     @classmethod
     def from_orm(cls, obj: object) -> SymbolResponse:
@@ -278,6 +329,13 @@ class GraphNodeResponse(BaseModel):
     is_test: bool = False
     is_entry_point: bool = False
     has_doc: bool = False
+    # Cross-link signals (populated by _collect_node_signals)
+    is_hotspot: bool = False
+    churn_percentile: float | None = None
+    is_dead: bool = False
+    dead_confidence: float | None = None
+    has_decision: bool = False
+    primary_owner: str | None = None
 
 
 class GraphEdgeResponse(BaseModel):
@@ -289,6 +347,36 @@ class GraphEdgeResponse(BaseModel):
 class GraphExportResponse(BaseModel):
     nodes: list[GraphNodeResponse]
     links: list[GraphEdgeResponse]
+    # When the graph is too large to return in full, the server caps the response
+    # to top-N nodes by PageRank. Clients should surface a banner.
+    truncated: bool = False
+    total_node_count: int | None = None
+
+
+# Architecture / community super-node graph
+class ArchitectureNodeResponse(BaseModel):
+    community_id: int
+    label: str
+    cohesion: float
+    member_count: int
+    top_file: str
+    avg_pagerank: float
+    hotspot_count: int = 0
+    dead_count: int = 0
+    has_decision: bool = False
+    doc_coverage_pct: float = 0.0
+    languages: list[str] = []
+
+
+class ArchitectureEdgeResponse(BaseModel):
+    source: int
+    target: int
+    edge_count: int
+
+
+class ArchitectureGraphResponse(BaseModel):
+    nodes: list[ArchitectureNodeResponse]
+    edges: list[ArchitectureEdgeResponse]
 
 
 # ---------------------------------------------------------------------------
@@ -353,7 +441,8 @@ class GitMetadataResponse(BaseModel):
             co_change_partners=json.loads(obj.co_change_partners_json),  # type: ignore[attr-defined]
             is_hotspot=obj.is_hotspot,  # type: ignore[attr-defined]
             is_stable=obj.is_stable,  # type: ignore[attr-defined]
-            churn_percentile=obj.churn_percentile,  # type: ignore[attr-defined]
+            # Normalize 0–1 → 0–100 to match the rest of the HTTP API.
+            churn_percentile=(obj.churn_percentile or 0.0) * 100.0,  # type: ignore[attr-defined]
             age_days=obj.age_days,  # type: ignore[attr-defined]
             bus_factor=obj.bus_factor or 0,  # type: ignore[attr-defined]
             contributor_count=obj.contributor_count or 0,  # type: ignore[attr-defined]
@@ -369,11 +458,15 @@ class GitMetadataResponse(BaseModel):
 
 class HotspotResponse(BaseModel):
     file_path: str
+    commit_count_total: int = 0
     commit_count_90d: int
     commit_count_30d: int
     churn_percentile: float
     temporal_hotspot_score: float | None = None
     primary_owner: str | None
+    primary_owner_commit_pct: float | None = None
+    recent_owner_name: str | None = None
+    recent_owner_commit_pct: float | None = None
     is_hotspot: bool
     is_stable: bool
     bus_factor: int
@@ -382,6 +475,10 @@ class HotspotResponse(BaseModel):
     lines_deleted_90d: int
     avg_commit_size: float
     commit_categories: dict
+    merge_commit_count_90d: int = 0
+    commit_count_capped: bool = False
+    age_days: int = 0
+    last_commit_at: datetime | None = None
 
 
 class OwnershipEntry(BaseModel):
@@ -489,6 +586,10 @@ class ModuleNodeResponse(BaseModel):
     symbol_count: int
     avg_pagerank: float
     doc_coverage_pct: float
+    hotspot_count: int = 0
+    dead_count: int = 0
+    has_decision: bool = False
+    primary_owner: str | None = None
 
 
 class ModuleEdgeResponse(BaseModel):
@@ -538,7 +639,13 @@ class DeadCodeGraphNodeResponse(BaseModel):
     is_test: bool = False
     is_entry_point: bool = False
     has_doc: bool = False
-    confidence_group: str  # "certain" | "likely"
+    is_hotspot: bool = False
+    churn_percentile: float | None = None
+    is_dead: bool = False
+    dead_confidence: float | None = None
+    has_decision: bool = False
+    primary_owner: str | None = None
+    confidence_group: str  # "certain" | "likely" | "neighbor"
 
 
 class DeadCodeGraphResponse(BaseModel):
@@ -562,6 +669,12 @@ class HotFilesNodeResponse(BaseModel):
     is_test: bool = False
     is_entry_point: bool = False
     has_doc: bool = False
+    is_hotspot: bool = False
+    churn_percentile: float | None = None
+    is_dead: bool = False
+    dead_confidence: float | None = None
+    has_decision: bool = False
+    primary_owner: str | None = None
     commit_count: int
 
 
@@ -828,8 +941,17 @@ class DecisionCreate(BaseModel):
 
 
 class DecisionStatusUpdate(BaseModel):
-    status: str
+    """PATCH body for /decisions/{id}.
+
+    All fields are optional — clients can update status alone (the historical
+    contract), the linked modules / files alone (governance editor), or both
+    in a single request. Fields left at ``None`` are preserved.
+    """
+
+    status: str | None = None
     superseded_by: str | None = None
+    affected_modules: list[str] | None = None
+    affected_files: list[str] | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -940,6 +1062,20 @@ class WorkspaceRepoEntry(BaseModel):
     page_count: int = 0
     doc_coverage_pct: float = 0.0
     hotspot_count: int = 0
+    # Lifecycle status — surfaced so the web UI can render "needs index"
+    # or "missing directory" affordances instead of silently dropping the
+    # repo from the sidebar.
+    #   "indexed"       — has .repowise/wiki.db with at least one Repository row
+    #   "needs_index"   — directory exists but no .repowise/wiki.db yet
+    #   "missing_dir"   — workspace config references a path that no longer exists
+    status: str = "indexed"
+    # Whether docs were generated for this repo. False means a user
+    # action ("repowise update --repo <alias> --docs") is required to
+    # populate the Docs/Overview tabs in the web UI.
+    docs_enabled: bool = True
+    # Optional skip reason captured in state.json — surfaced as a
+    # transparency hint when docs are disabled.
+    docs_skip_reason: str | None = None
 
 
 class WorkspaceCrossRepoSummary(BaseModel):
@@ -962,6 +1098,21 @@ class WorkspaceResponse(BaseModel):
     default_repo: str | None = None
     cross_repo_summary: WorkspaceCrossRepoSummary | None = None
     contract_summary: WorkspaceContractSummary | None = None
+
+
+class WorkspaceSyncResult(BaseModel):
+    alias: str
+    job_id: str | None = None
+    repo_id: str | None = None
+    status: str  # "accepted", "skipped", "error"
+    reason: str | None = None
+
+
+class WorkspaceSyncResponse(BaseModel):
+    results: list[WorkspaceSyncResult]
+    accepted: int = 0
+    skipped: int = 0
+    errors: int = 0
 
 
 class WorkspaceContractEntry(BaseModel):
@@ -1009,3 +1160,238 @@ class WorkspaceCoChangeEntry(BaseModel):
 class WorkspaceCoChangesResponse(BaseModel):
     co_changes: list[WorkspaceCoChangeEntry]
     total: int
+
+
+class WorkspaceGraphNode(BaseModel):
+    repo_id: str
+    name: str
+    file_count: int = 0
+    coverage_pct: float = 0.0
+    health_score: int = 0
+    top_language: str = "unknown"
+
+
+class WorkspaceGraphEdge(BaseModel):
+    source: str
+    target: str
+    type: str  # "contract" or "co_change"
+    strength: float = 0.0
+    label: str | None = None
+
+
+class WorkspaceGraphResponse(BaseModel):
+    nodes: list[WorkspaceGraphNode] = []
+    edges: list[WorkspaceGraphEdge] = []
+
+
+# ---------------------------------------------------------------------------
+# Owner / Contributor profile
+# ---------------------------------------------------------------------------
+
+
+class OwnerListEntry(BaseModel):
+    """One row in the engineering-leader-facing owners directory."""
+
+    key: str  # stable identifier for the URL (email if known, else name)
+    name: str
+    email: str | None
+    files_owned: int
+    hotspots_owned: int
+    silo_modules: int  # modules where this owner is >80%
+    dead_code_files_owned: int
+    dead_code_lines_owned: int
+    commit_count_90d: int  # sum of per-file 90d commits attributed to this person
+    last_commit_at: datetime | None
+    bus_factor_risk_files: int  # files they own where bus_factor <= 1
+
+
+class OwnerModuleRollup(BaseModel):
+    module_path: str
+    file_count: int
+    hotspot_count: int
+    dominant_pct: float  # share of files in module owned by this person
+
+
+class OwnerFileEntry(BaseModel):
+    file_path: str
+    commit_count_90d: int
+    churn_percentile: float  # 0-100
+    bus_factor: int
+    is_hotspot: bool
+    last_commit_at: datetime | None
+    primary_owner_commit_pct: float | None
+
+
+class OwnerCoAuthor(BaseModel):
+    name: str
+    email: str | None
+    shared_files: int
+    co_change_strength: float  # 0-1 fraction
+
+
+class OwnerProfileResponse(BaseModel):
+    key: str
+    name: str
+    email: str | None
+
+    # Headline metrics
+    files_owned: int
+    hotspots_owned: int
+    silo_modules: int
+    dead_code_files_owned: int
+    dead_code_lines_owned: int
+    commit_count_90d: int
+    last_commit_at: datetime | None
+    first_commit_at: datetime | None
+    bus_factor_risk_files: int
+
+    # 90d activity proxies (approximated from file-level totals weighted by
+    # this person's share of commits on each file). They are estimates, not
+    # exact per-author diff sizes — we never indexed per-author byte counts.
+    lines_added_90d_est: int
+    lines_deleted_90d_est: int
+
+    # Breakdowns
+    modules: list[OwnerModuleRollup]
+    top_files: list[OwnerFileEntry]
+    co_authors: list[OwnerCoAuthor]
+
+    # Commit-category mix across files they touch (sum of categories).
+    commit_categories: dict
+
+
+# ---------------------------------------------------------------------------
+# Module Health
+# ---------------------------------------------------------------------------
+
+
+class ModuleHealthOwner(BaseModel):
+    name: str
+    email: str | None
+    file_count: int
+    pct: float
+
+
+class ModuleHealthSummary(BaseModel):
+    """One row in the per-module health rollup."""
+
+    module_path: str
+    file_count: int
+    symbol_count: int
+    hotspot_count: int
+    dead_code_count: int
+    dead_code_lines: int
+    avg_churn_percentile: float  # 0-100
+    median_bus_factor: float
+    min_bus_factor: int
+    primary_owner: str | None
+    primary_owner_pct: float
+    is_silo: bool
+    decision_count: int
+    doc_coverage_pct: float
+    # Composite 0–100 — higher = healthier (high docs, distributed ownership,
+    # low dead code, manageable churn). Used to rank modules at a glance.
+    health_score: float
+
+
+class ModuleHealthDetail(ModuleHealthSummary):
+    """Single-module deep view with breakdowns."""
+
+    owners: list[ModuleHealthOwner]
+    top_hotspots: list[str]
+    governing_decisions: list[str]  # decision ids
+    contributor_count: int
+
+
+# ---------------------------------------------------------------------------
+# Reviewer Suggestions
+# ---------------------------------------------------------------------------
+
+
+class ReviewerSuggestion(BaseModel):
+    name: str
+    email: str | None
+    score: float  # 0-1 composite
+    recent_commits: int  # commits in the last 90d across the requested paths
+    owned_paths: list[str]
+    co_change_paths: list[str]
+    reasons: list[str]
+
+
+class ReviewerSuggestionsResponse(BaseModel):
+    paths: list[str]
+    suggestions: list[ReviewerSuggestion]
+
+
+# ---------------------------------------------------------------------------
+# C4 diagrams (L1 System Context, L2 Containers, L3 Components)
+# ---------------------------------------------------------------------------
+
+
+class C4PersonResponse(BaseModel):
+    id: str
+    name: str
+    description: str = ""
+
+
+class C4SystemResponse(BaseModel):
+    id: str
+    name: str
+    description: str = ""
+
+
+class C4ExternalSystemResponse(BaseModel):
+    id: str
+    name: str
+    display_name: str
+    category: str  # framework | service | tool | library
+    ecosystem: str
+    version: str | None = None
+
+
+class C4ContainerResponse(BaseModel):
+    id: str
+    name: str
+    path: str
+    language: str
+    file_count: int
+    symbol_count: int
+    hotspot_count: int = 0
+    dead_count: int = 0
+
+
+class C4ComponentResponse(BaseModel):
+    id: str
+    name: str
+    path: str
+    container_id: str
+    file_count: int
+    symbol_count: int
+
+
+class C4RelationResponse(BaseModel):
+    source_id: str
+    target_id: str
+    label: str = ""
+    edge_count: int = 1
+    edge_types: list[str] = Field(default_factory=list)
+
+
+class C4L1Response(BaseModel):
+    system: C4SystemResponse
+    people: list[C4PersonResponse]
+    external_systems: list[C4ExternalSystemResponse]
+    relations: list[C4RelationResponse]
+
+
+class C4L2Response(BaseModel):
+    containers: list[C4ContainerResponse]
+    external_systems: list[C4ExternalSystemResponse]
+    relations: list[C4RelationResponse]
+
+
+class C4L3Response(BaseModel):
+    container: C4ContainerResponse
+    components: list[C4ComponentResponse]
+    external_systems: list[C4ExternalSystemResponse]
+    relations: list[C4RelationResponse]

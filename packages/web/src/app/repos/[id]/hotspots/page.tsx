@@ -1,14 +1,16 @@
 import type { Metadata } from "next";
 import { Flame, Shield } from "lucide-react";
-import { StatCard } from "@/components/shared/stat-card";
-import { HotspotTable } from "@/components/git/hotspot-table";
-import { ContributorBar } from "@/components/git/contributor-bar";
-import { ChurnHistogram } from "@/components/git/churn-histogram";
-import { CommitCategoryDonut } from "@/components/git/commit-category-donut";
-import { RiskDistributionChart } from "@/components/git/risk-distribution-chart";
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { StatCard } from "@repowise-dev/ui/shared/stat-card";
+import { RoutedToRiskBanner } from "@/components/risk/routed-to-risk-banner";
+import { HotspotTable } from "@repowise-dev/ui/git/hotspot-table";
+import { ContributorBar } from "@repowise-dev/ui/git/contributor-bar";
+import { ChurnHistogram } from "@repowise-dev/ui/git/churn-histogram";
+import { CommitCategoryDonut } from "@repowise-dev/ui/git/commit-category-donut";
+import { RiskDistributionChart } from "@repowise-dev/ui/git/risk-distribution-chart";
+import { Card, CardContent, CardHeader, CardTitle } from "@repowise-dev/ui/ui/card";
 import { getHotspots, getGitSummary } from "@/lib/api/git";
-import { formatNumber } from "@/lib/utils/format";
+import { HealthRisksPanel } from "@/components/health/health-risks-panel";
+import { formatNumber } from "@repowise-dev/ui/lib/format";
 
 export const metadata: Metadata = { title: "Hotspots" };
 
@@ -22,13 +24,15 @@ export default async function HotspotsPage({
   let hotspots: Awaited<ReturnType<typeof getHotspots>> = [];
   let summary: Awaited<ReturnType<typeof getGitSummary>> | null = null;
 
+  let loadError: Error | null = null;
   try {
     [hotspots, summary] = await Promise.all([
       getHotspots(id, 100),
       getGitSummary(id),
     ]);
-  } catch {
-    // API unavailable
+  } catch (err) {
+    loadError = err instanceof Error ? err : new Error("Couldn't load hotspots");
+    console.error("[hotspots] load failed:", err);
   }
 
   // Aggregate commit categories across all hotspot files
@@ -43,6 +47,7 @@ export default async function HotspotsPage({
 
   return (
     <div className="p-4 sm:p-6 space-y-6 max-w-[1600px]">
+      <RoutedToRiskBanner repoId={id} tab="hotspots" />
       <div>
         <h1 className="text-xl font-semibold text-[var(--color-text-primary)] mb-1 flex items-center gap-2">
           <Flame className="h-5 w-5 text-red-500" />
@@ -52,6 +57,12 @@ export default async function HotspotsPage({
           High-churn files — where the most risky code lives.
         </p>
       </div>
+
+      {loadError && hotspots.length === 0 && (
+        <div className="rounded-lg border border-[var(--color-border-default)] bg-[var(--color-bg-elevated)] p-4 text-sm text-[var(--color-text-secondary)]">
+          Couldn&apos;t load hotspots. The data may not be ready yet — try running a sync first.
+        </div>
+      )}
 
       {/* Summary cards */}
       {summary && (
@@ -128,9 +139,11 @@ export default async function HotspotsPage({
       {/* Table + sidebar */}
       <div className="grid grid-cols-1 gap-6 xl:grid-cols-4">
         <div className="xl:col-span-3">
-          <HotspotTable hotspots={hotspots} />
+          <HotspotTable hotspots={hotspots} repoId={id} />
         </div>
 
+        <div className="space-y-4">
+          <HealthRisksPanel repoId={id} title="Health risks in this list" limit={6} />
         {/* Top owners leaderboard */}
         {summary && summary.top_owners.length > 0 && (
           <Card>
@@ -142,7 +155,12 @@ export default async function HotspotsPage({
               <div className="mt-3 space-y-1.5">
                 {summary.top_owners.slice(0, 5).map((o, i) => (
                   <div key={o.email || `owner-${i}`} className="flex items-center justify-between text-xs">
-                    <span className="text-[var(--color-text-secondary)] truncate">{o.name}</span>
+                    <span
+                      className="text-[var(--color-text-secondary)] truncate"
+                      title={o.email ? `${o.name} <${o.email}>` : o.name}
+                    >
+                      {o.name}
+                    </span>
                     <span className="text-[var(--color-text-tertiary)] tabular-nums ml-2">
                       {formatNumber(o.file_count)} files ({Math.round(o.pct * 100)}%)
                     </span>
@@ -152,6 +170,7 @@ export default async function HotspotsPage({
             </CardContent>
           </Card>
         )}
+        </div>
       </div>
     </div>
   );

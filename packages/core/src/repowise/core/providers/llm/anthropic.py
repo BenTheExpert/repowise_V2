@@ -13,31 +13,33 @@ Recommended models (as of 2026):
 from __future__ import annotations
 
 import os
+from typing import TYPE_CHECKING, Any, AsyncIterator
 
 import structlog
+from anthropic import APIStatusError as _AnthropicAPIStatusError
 from anthropic import AsyncAnthropic
 from anthropic import RateLimitError as _AnthropicRateLimitError
-from anthropic import APIStatusError as _AnthropicAPIStatusError
 from tenacity import (
+    RetryError,
+    before_sleep_log,
     retry,
     retry_if_exception_type,
     stop_after_attempt,
     wait_exponential_jitter,
-    before_sleep_log,
-    RetryError,
 )
 
 from repowise.core.providers.llm.base import (
     BaseProvider,
+    CacheHint,
     ChatStreamEvent,
     ChatToolCall,
     GeneratedResponse,
     ProviderError,
     RateLimitError,
+    ensure_reasoning_supported,
 )
-
-from typing import TYPE_CHECKING, Any, AsyncIterator
 from repowise.core.rate_limiter import RateLimiter
+from repowise.core.reasoning import ReasoningMode
 
 if TYPE_CHECKING:
     from repowise.core.generation.cost_tracker import CostTracker
@@ -55,6 +57,7 @@ class AnthropicProvider(BaseProvider):
     Args:
         api_key:      Anthropic API key. Falls back to ANTHROPIC_API_KEY env var.
         model:        Model identifier. Defaults to claude-sonnet-4-6.
+        base_url:     Optional custom API base URL (for proxies/self-hosted endpoints).
         rate_limiter: Optional pre-configured RateLimiter. If None, no rate limiting
                       is applied (useful when the caller manages concurrency via semaphore).
     """
@@ -63,6 +66,7 @@ class AnthropicProvider(BaseProvider):
         self,
         api_key: str | None = None,
         model: str = "claude-sonnet-4-6",
+        base_url: str | None = None,
         rate_limiter: RateLimiter | None = None,
         cost_tracker: CostTracker | None = None,
     ) -> None:
@@ -72,7 +76,8 @@ class AnthropicProvider(BaseProvider):
                 "anthropic",
                 "No API key provided. Pass api_key= or set ANTHROPIC_API_KEY.",
             )
-        self._client = AsyncAnthropic(api_key=resolved_key)
+        resolved_base_url = base_url or os.environ.get("ANTHROPIC_BASE_URL")
+        self._client = AsyncAnthropic(api_key=resolved_key, base_url=resolved_base_url)
         self._model = model
         self._rate_limiter = rate_limiter
         self._cost_tracker = cost_tracker
@@ -92,7 +97,10 @@ class AnthropicProvider(BaseProvider):
         max_tokens: int = 4096,
         temperature: float = 0.3,
         request_id: str | None = None,
+        reasoning: ReasoningMode = "auto",
+        cache_hints: tuple[CacheHint, ...] = (),
     ) -> GeneratedResponse:
+        ensure_reasoning_supported("anthropic", self._model, reasoning)
         if self._rate_limiter:
             await self._rate_limiter.acquire(estimated_tokens=max_tokens)
 
@@ -110,6 +118,7 @@ class AnthropicProvider(BaseProvider):
                 max_tokens=max_tokens,
                 temperature=temperature,
                 request_id=request_id,
+                cache_hints=cache_hints,
             )
         except RetryError as exc:
             raise ProviderError(
@@ -130,14 +139,18 @@ class AnthropicProvider(BaseProvider):
         max_tokens: int,
         temperature: float,
         request_id: str | None,
+        cache_hints: tuple[CacheHint, ...] = (),
     ) -> GeneratedResponse:
+        system_param, messages_param = _build_cached_payload(
+            system_prompt, user_prompt, cache_hints
+        )
         try:
             response = await self._client.messages.create(
                 model=self._model,
                 max_tokens=max_tokens,
                 temperature=temperature,
-                system=system_prompt,
-                messages=[{"role": "user", "content": user_prompt}],
+                system=system_param,
+                messages=messages_param,
             )
         except _AnthropicRateLimitError as exc:
             raise RateLimitError("anthropic", str(exc), status_code=429) from exc
@@ -279,6 +292,48 @@ class AnthropicProvider(BaseProvider):
             raise RateLimitError("anthropic", str(exc), status_code=429) from exc
         except _AnthropicAPIStatusError as exc:
             raise ProviderError("anthropic", str(exc), status_code=exc.status_code) from exc
+
+
+def _build_cached_payload(
+    system_prompt: str,
+    user_prompt: str,
+    cache_hints: tuple[CacheHint, ...],
+) -> tuple[Any, list[dict[str, Any]]]:
+    """Translate cache hints into Anthropic-format system/messages blocks.
+
+    Without hints, returns the plain (system_string, [{user content}]) form.
+    With hints, returns content-block lists tagged with cache_control.
+    Anthropic enforces a hard limit of 4 cache breakpoints — we honor at most
+    two (system, then optional user prefix), matching the supported segments.
+    """
+    if not cache_hints:
+        return system_prompt, [{"role": "user", "content": user_prompt}]
+
+    system_param: Any = system_prompt
+    if any(h.segment == "system" for h in cache_hints) and system_prompt:
+        system_param = [
+            {
+                "type": "text",
+                "text": system_prompt,
+                "cache_control": {"type": "ephemeral"},
+            }
+        ]
+
+    user_prefix_hint = next(
+        (h for h in cache_hints if h.segment == "user_prefix" and h.prefix_chars > 0),
+        None,
+    )
+    if user_prefix_hint is not None and user_prefix_hint.prefix_chars < len(user_prompt):
+        prefix = user_prompt[: user_prefix_hint.prefix_chars]
+        rest = user_prompt[user_prefix_hint.prefix_chars :]
+        user_content: Any = [
+            {"type": "text", "text": prefix, "cache_control": {"type": "ephemeral"}},
+            {"type": "text", "text": rest},
+        ]
+    else:
+        user_content = user_prompt
+
+    return system_param, [{"role": "user", "content": user_content}]
 
 
 def _to_anthropic_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:

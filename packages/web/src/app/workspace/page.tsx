@@ -11,13 +11,15 @@ import {
   ArrowRight,
 } from "lucide-react";
 import { getWorkspace, getWorkspaceCoChanges } from "@/lib/api/workspace";
-import { StatCard } from "@/components/shared/stat-card";
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
-import { RepoCard } from "@/components/workspace/repo-card";
-import { CrossRepoSummary } from "@/components/workspace/cross-repo-summary";
-import { CoChangeTable } from "@/components/workspace/co-change-table";
-import { ContractTypeBadge } from "@/components/workspace/contract-type-badge";
-import { formatNumber } from "@/lib/utils/format";
+import { StatCard } from "@repowise-dev/ui/shared/stat-card";
+import { Card, CardContent, CardHeader, CardTitle } from "@repowise-dev/ui/ui/card";
+import { RepoCard } from "@repowise-dev/ui/workspace/repo-card";
+import { CrossRepoSummary } from "@repowise-dev/ui/workspace/cross-repo-summary";
+import { CoChangeTable } from "@repowise-dev/ui/workspace/co-change-table";
+import { ContractTypeBadge } from "@repowise-dev/ui/workspace/contract-type-badge";
+import { formatNumber } from "@repowise-dev/ui/lib/format";
+import { WorkspaceGraphSection } from "./workspace-graph-section";
+import { SyncButton } from "./sync-buttons";
 
 export const metadata: Metadata = { title: "Workspace" };
 
@@ -58,21 +60,29 @@ export default async function WorkspaceDashboardPage() {
   return (
     <div className="p-5 sm:p-8 space-y-8 max-w-[1200px]">
       {/* Header */}
-      <div>
-        <div className="flex items-center gap-2.5 mb-1">
-          <Layers className="h-6 w-6 text-[var(--color-accent-primary)]" />
-          <h1 className="text-2xl font-semibold text-[var(--color-text-primary)]">
-            {workspace?.workspace_name ?? "Workspace"}
-          </h1>
+      <div className="flex items-start justify-between gap-4 flex-wrap">
+        <div>
+          <div className="flex items-center gap-2.5 mb-1">
+            <Layers className="h-6 w-6 text-[var(--color-accent-primary)]" />
+            <h1 className="text-2xl font-semibold text-[var(--color-text-primary)]">
+              {workspace?.workspace_name ?? "Workspace"}
+            </h1>
+          </div>
+          <p className="text-sm text-[var(--color-text-secondary)]">
+            {workspace?.repos.length ?? 0} repositories
+            {workspace?.workspace_root && (
+              <span
+                className="text-[var(--color-text-tertiary)] font-mono break-all"
+                title={workspace.workspace_root}
+              >
+                {" "}&middot; {workspace.workspace_root}
+              </span>
+            )}
+          </p>
         </div>
-        <p className="text-sm text-[var(--color-text-secondary)]">
-          {workspace?.repos.length ?? 0} repositories
-          {workspace?.workspace_root && (
-            <span className="text-[var(--color-text-tertiary)]">
-              {" "}&middot; {workspace.workspace_root}
-            </span>
-          )}
-        </p>
+        {(workspace?.repos.length ?? 0) > 0 && (
+          <SyncButton variant="primary" label="Sync workspace" />
+        )}
       </div>
 
       {/* Aggregate Stats */}
@@ -110,7 +120,10 @@ export default async function WorkspaceDashboardPage() {
           Repositories
         </h2>
         <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
-          {wsRepos.map((wsRepo) => (
+          {wsRepos.map((wsRepo) => {
+            const status = wsRepo.status ?? (wsRepo.repo_id ? "indexed" : "needs_index");
+            const isUnindexed = status !== "indexed";
+            return (
               <RepoCard
                 key={wsRepo.alias}
                 repoId={wsRepo.repo_id ?? ""}
@@ -118,6 +131,8 @@ export default async function WorkspaceDashboardPage() {
                 name={wsRepo.alias}
                 path={wsRepo.path}
                 isPrimary={wsRepo.is_primary}
+                status={status}
+                docsSkipReason={wsRepo.docs_skip_reason ?? null}
                 stats={wsRepo.file_count > 0 ? {
                   file_count: wsRepo.file_count,
                   symbol_count: wsRepo.symbol_count,
@@ -133,10 +148,22 @@ export default async function WorkspaceDashboardPage() {
                   average_churn_percentile: 0,
                   top_owners: [],
                 } : null}
+                actions={
+                  status !== "missing_dir" ? (
+                    <SyncButton
+                      alias={wsRepo.alias}
+                      label={isUnindexed ? "Index now" : "Sync"}
+                    />
+                  ) : null
+                }
               />
-          ))}
+            );
+          })}
         </div>
       </section>
+
+      {/* Cross-Repo Graph */}
+      <WorkspaceGraphSection repoCount={wsRepos.length} />
 
       {/* Cross-Repo Intelligence */}
       {(workspace?.cross_repo_summary || workspace?.contract_summary) && (

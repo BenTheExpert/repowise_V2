@@ -2,25 +2,26 @@
 
 import { useState, useEffect } from "react";
 import { config } from "@/lib/config";
-import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card";
-import { Label } from "@/components/ui/label";
-import { Input } from "@/components/ui/input";
-import { Badge } from "@/components/ui/badge";
+import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@repowise-dev/ui/ui/card";
+import { Label } from "@repowise-dev/ui/ui/label";
+import { Input } from "@repowise-dev/ui/ui/input";
+import { Badge } from "@repowise-dev/ui/ui/badge";
 import {
   Select,
   SelectContent,
   SelectItem,
   SelectTrigger,
   SelectValue,
-} from "@/components/ui/select";
+} from "@repowise-dev/ui/ui/select";
 
-const PROVIDERS = ["gemini", "openai", "anthropic", "ollama", "litellm", "mock"] as const;
+const PROVIDERS = ["gemini", "openai", "anthropic", "deepseek", "ollama", "litellm", "mock"] as const;
 const EMBEDDERS = ["mock", "gemini", "openai"] as const;
 
 const MODEL_PLACEHOLDERS: Record<string, string> = {
   gemini: "gemini-3.1-flash-lite-preview",
-  openai: "gpt-4.1",
+  openai: "gpt-5.4-nano",
   anthropic: "claude-sonnet-4-6",
+  deepseek: "deepseek-v4-flash",
   ollama: "llama3.2",
   litellm: "groq/llama-3.1-70b-versatile",
   mock: "mock",
@@ -31,6 +32,7 @@ const PROVIDER_ENV_VARS: Record<string, { vars: string[]; installHint: string }>
   openai: { vars: ["OPENAI_API_KEY"], installHint: "pip install openai" },
   anthropic: { vars: ["ANTHROPIC_API_KEY"], installHint: "pip install anthropic" },
   ollama: { vars: ["OLLAMA_BASE_URL"], installHint: "https://ollama.ai" },
+  deepseek: { vars: ["DEEPSEEK_API_KEY"], installHint: "pip install openai" },
   litellm: { vars: ["LITELLM_*"], installHint: "pip install litellm" },
   mock: { vars: [], installHint: "No key needed" },
 };

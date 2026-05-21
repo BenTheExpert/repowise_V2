@@ -11,13 +11,8 @@ import {
   GitBranch,
   Lightbulb,
   MessageSquare,
-  Search,
   Code2,
-  BarChart3,
-  Users,
-  Flame,
-  Trash2,
-  Radar,
+  ShieldAlert,
   DollarSign,
   Settings,
   ChevronDown,
@@ -27,11 +22,17 @@ import {
   Layers,
   Link2,
   GitMerge,
+  Users,
+  Boxes,
+  HeartPulse,
+  TestTubeDiagonal,
+  Wrench,
+  TrendingUp,
 } from "lucide-react";
 import { cn } from "@/lib/utils/cn";
-import { ScrollArea } from "@/components/ui/scroll-area";
-import { Separator } from "@/components/ui/separator";
-import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
+import { ScrollArea } from "@repowise-dev/ui/ui/scroll-area";
+import { Separator } from "@repowise-dev/ui/ui/separator";
+import { Tooltip, TooltipContent, TooltipTrigger } from "@repowise-dev/ui/ui/tooltip";
 import { AddRepoDialog } from "@/components/repos/add-repo-dialog";
 import type { RepoResponse, WorkspaceResponse } from "@/lib/api/types";
 
@@ -39,6 +40,7 @@ interface NavItem {
   label: string;
   href: string;
   icon: React.ComponentType<{ className?: string }>;
+  exact?: boolean;
 }
 
 const GLOBAL_NAV: NavItem[] = [
@@ -47,7 +49,7 @@ const GLOBAL_NAV: NavItem[] = [
 ];
 
 const WORKSPACE_NAV: NavItem[] = [
-  { label: "Overview", href: "/workspace", icon: Layers },
+  { label: "Overview", href: "/workspace", icon: Layers, exact: true },
   { label: "Contracts", href: "/workspace/contracts", icon: Link2 },
   { label: "Co-Changes", href: "/workspace/co-changes", icon: GitMerge },
 ];
@@ -56,18 +58,20 @@ const WORKSPACE_NAV: NavItem[] = [
 function repoNavItems(repoId: string): NavItem[] {
   return [
     { label: "Overview", href: `/repos/${repoId}/overview`, icon: Activity },
-    { label: "Chat", href: `/repos/${repoId}`, icon: MessageSquare },
-    { label: "Docs", href: `/repos/${repoId}/docs`, icon: BookOpen },
-    { label: "Search", href: `/repos/${repoId}/search`, icon: Search },
+    { label: "Chat", href: `/repos/${repoId}`, icon: MessageSquare, exact: true },
+    { label: "Risk", href: `/repos/${repoId}/risk`, icon: ShieldAlert },
+    { label: "Health", href: `/repos/${repoId}/health`, icon: HeartPulse, exact: true },
+    { label: "Trend", href: `/repos/${repoId}/health/trend`, icon: TrendingUp },
+    { label: "Coverage", href: `/repos/${repoId}/health/coverage`, icon: TestTubeDiagonal },
+    { label: "Refactoring", href: `/repos/${repoId}/health/refactoring-targets`, icon: Wrench },
     { label: "Graph", href: `/repos/${repoId}/graph`, icon: GitBranch },
+    { label: "C4 Diagram", href: `/repos/${repoId}/c4`, icon: Boxes },
     { label: "Symbols", href: `/repos/${repoId}/symbols`, icon: Code2 },
-    { label: "Coverage", href: `/repos/${repoId}/coverage`, icon: BarChart3 },
-    { label: "Ownership", href: `/repos/${repoId}/ownership`, icon: Users },
-    { label: "Hotspots", href: `/repos/${repoId}/hotspots`, icon: Flame },
-    { label: "Dead Code", href: `/repos/${repoId}/dead-code`, icon: Trash2 },
-    { label: "Blast Radius", href: `/repos/${repoId}/blast-radius`, icon: Radar },
+    { label: "Contributors", href: `/repos/${repoId}/owners`, icon: Users },
     { label: "Decisions", href: `/repos/${repoId}/decisions`, icon: Lightbulb },
+    { label: "Docs", href: `/repos/${repoId}/docs`, icon: BookOpen },
     { label: "Costs", href: `/repos/${repoId}/costs`, icon: DollarSign },
+    { label: "Security", href: `/repos/${repoId}/security`, icon: ShieldAlert },
     { label: "Settings", href: `/repos/${repoId}/settings`, icon: Settings },
   ];
 }
@@ -81,9 +85,24 @@ interface SidebarProps {
 export function Sidebar({ repos = [], activeRepoId, workspace }: SidebarProps) {
   const isWorkspace = workspace?.is_workspace ?? false;
   const pathname = usePathname();
+  const derivedActiveRepoId = React.useMemo(() => {
+    if (activeRepoId) return activeRepoId;
+    const m = pathname?.match(/^\/repos\/([^/]+)/);
+    return m ? m[1] : undefined;
+  }, [activeRepoId, pathname]);
   const [expandedRepos, setExpandedRepos] = React.useState<Set<string>>(
-    activeRepoId ? new Set([activeRepoId]) : new Set(),
+    derivedActiveRepoId ? new Set([derivedActiveRepoId]) : new Set(),
   );
+  React.useEffect(() => {
+    if (derivedActiveRepoId) {
+      setExpandedRepos((prev) => {
+        if (prev.has(derivedActiveRepoId)) return prev;
+        const next = new Set(prev);
+        next.add(derivedActiveRepoId);
+        return next;
+      });
+    }
+  }, [derivedActiveRepoId]);
   const [collapsed, setCollapsed] = React.useState(false);
 
   const toggleRepo = (id: string) => {
@@ -120,14 +139,16 @@ export function Sidebar({ repos = [], activeRepoId, workspace }: SidebarProps) {
         )}
         <button
           onClick={() => setCollapsed((c) => !c)}
-          className="ml-auto shrink-0 rounded-md p-1.5 text-[var(--color-text-tertiary)] hover:bg-[var(--color-bg-elevated)] hover:text-[var(--color-text-secondary)] transition-colors"
+          className="ml-auto shrink-0 rounded-md p-2.5 text-[var(--color-text-tertiary)] hover:bg-[var(--color-bg-elevated)] hover:text-[var(--color-text-secondary)] transition-colors"
           aria-label={isIconOnly ? "Expand sidebar" : "Collapse sidebar"}
+          aria-expanded={!isIconOnly}
+          aria-controls="sidebar-nav"
         >
           <PanelLeft className={cn("h-4 w-4 transition-transform", isIconOnly && "rotate-180")} />
         </button>
       </div>
 
-      <ScrollArea className="flex-1">
+      <ScrollArea className="flex-1" id="sidebar-nav">
         <div className={cn("px-3 py-2", isIconOnly && "px-2")}>
           {/* Global nav */}
           <nav className="space-y-1">
@@ -158,11 +179,7 @@ export function Sidebar({ repos = [], activeRepoId, workspace }: SidebarProps) {
                   <SidebarNavItem
                     key={item.href}
                     item={item}
-                    isActive={
-                      item.href === "/workspace"
-                        ? pathname === "/workspace"
-                        : pathname.startsWith(`${item.href}`)
-                    }
+                    isActive={item.exact ? pathname === item.href : pathname.startsWith(`${item.href}`)}
                     iconOnly={isIconOnly}
                   />
                 ))}
@@ -184,8 +201,57 @@ export function Sidebar({ repos = [], activeRepoId, workspace }: SidebarProps) {
               <div className="space-y-0.5">
                 {repos.map((repo) => {
                   const isExpanded = expandedRepos.has(repo.id);
-                  const isActive = activeRepoId === repo.id;
+                  const isActive = derivedActiveRepoId === repo.id;
                   const navItems = repoNavItems(repo.id);
+                  const needsIndex =
+                    repo.workspace_status === "needs_index" ||
+                    repo.id.startsWith("ws:");
+                  const isMissing = repo.workspace_status === "missing_dir";
+
+                  if (needsIndex || isMissing) {
+                    // Synthetic / unindexed workspace entry — show as a
+                    // disabled row with a status hint. The Index/Sync
+                    // CTA lives in the Workspace dashboard.
+                    if (isIconOnly) {
+                      return (
+                        <Tooltip key={repo.id}>
+                          <TooltipTrigger asChild>
+                            <div
+                              className="flex w-full items-center justify-center rounded-md p-2 text-[var(--color-text-tertiary)] opacity-60"
+                              aria-label={`${repo.name} (${isMissing ? "missing" : "needs index"})`}
+                            >
+                              <Circle className="h-2.5 w-2.5 stroke-current" />
+                            </div>
+                          </TooltipTrigger>
+                          <TooltipContent side="right">
+                            {repo.workspace_alias ?? repo.name}
+                            {" — "}
+                            {isMissing ? "directory missing" : "needs indexing"}
+                          </TooltipContent>
+                        </Tooltip>
+                      );
+                    }
+                    return (
+                      <Link
+                        key={repo.id}
+                        href="/workspace"
+                        className="flex w-full items-center gap-2.5 rounded-lg px-2 py-2 text-sm text-[var(--color-text-tertiary)] transition-colors hover:bg-[var(--color-bg-elevated)]"
+                        title={
+                          isMissing
+                            ? "Directory missing — open Workspace to remove or fix"
+                            : "Not indexed yet — open Workspace to index"
+                        }
+                      >
+                        <Circle className="h-2 w-2 shrink-0 stroke-current" />
+                        <span className="flex-1 truncate text-left font-medium">
+                          {repo.workspace_alias ?? repo.name}
+                        </span>
+                        <span className="shrink-0 rounded-full bg-[var(--color-bg-elevated)] px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide text-[var(--color-text-tertiary)]">
+                          {isMissing ? "missing" : "index"}
+                        </span>
+                      </Link>
+                    );
+                  }
 
                   if (isIconOnly) {
                     return (
@@ -211,6 +277,8 @@ export function Sidebar({ repos = [], activeRepoId, workspace }: SidebarProps) {
                     <div key={repo.id}>
                       <button
                         onClick={() => toggleRepo(repo.id)}
+                        aria-expanded={isExpanded}
+                        aria-controls={`sidebar-repo-${repo.id}`}
                         className={cn(
                           "flex w-full items-center gap-2.5 rounded-lg px-2 py-2 text-sm transition-colors hover:bg-[var(--color-bg-elevated)]",
                           isActive
@@ -231,12 +299,12 @@ export function Sidebar({ repos = [], activeRepoId, workspace }: SidebarProps) {
                         )}
                       </button>
                       {isExpanded && (
-                        <div className="ml-3.5 mt-0.5 space-y-0.5 border-l border-[var(--color-border-default)] pl-3">
+                        <div id={`sidebar-repo-${repo.id}`} className="ml-3.5 mt-0.5 space-y-0.5 border-l border-[var(--color-border-default)] pl-3">
                           {navItems.map((item) => (
                             <SidebarNavItem
                               key={item.href}
                               item={item}
-                              isActive={pathname === item.href || pathname.startsWith(`${item.href}/`)}
+                              isActive={item.exact ? pathname === item.href : (pathname === item.href || pathname.startsWith(`${item.href}/`))}
                               size="sm"
                               iconOnly={false}
                             />
@@ -306,7 +374,7 @@ function SidebarNavItem({
                 : "text-[var(--color-text-secondary)] hover:bg-[var(--color-bg-elevated)] hover:text-[var(--color-text-primary)]",
             )}
           >
-            <Icon className="h-4.5 w-4.5 shrink-0" />
+            <Icon className="h-[18px] w-[18px] shrink-0" />
           </Link>
         </TooltipTrigger>
         <TooltipContent side="right">{item.label}</TooltipContent>

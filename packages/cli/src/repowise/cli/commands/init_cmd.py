@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import os
 import sys
 import time
@@ -14,6 +13,12 @@ from rich.progress import BarColumn, Progress, SpinnerColumn, TextColumn, TimeEl
 from rich.table import Table
 
 from repowise.cli.cost_estimator import build_generation_plan, estimate_cost
+from repowise.cli.editor_integrations.defaults import get_default_disabled_project_files
+from repowise.cli.editor_setup import (
+    register_editor_clients,
+    resolve_editor_setup_options,
+    write_editor_project_files,
+)
 from repowise.cli.helpers import (
     console,
     ensure_repowise_dir,
@@ -21,6 +26,7 @@ from repowise.cli.helpers import (
     load_config,
     load_state,
     resolve_provider,
+    resolve_reasoning,
     resolve_repo_path,
     run_async,
     save_config,
@@ -31,6 +37,32 @@ from repowise.cli.ui import MaybeCountColumn
 # ---------------------------------------------------------------------------
 # Helpers (kept in this file; _resolve_embedder also imported by other cmds)
 # ---------------------------------------------------------------------------
+
+
+class CostGateDeclined(Exception):
+    """Raised when the user answers No at the LLM-cost confirmation prompt.
+
+    Carries no payload — the caller just needs to know that generation was
+    declined so it can persist state in index-only shape (no docs) and
+    return cleanly. Using an exception (vs. a sentinel return value) lets
+    us bail out of nested generation flows without rethreading return
+    types through every helper.
+    """
+
+
+def _confirm_cost_gate(message: str) -> bool:
+    """Render the cost-gate `[y/N]` prompt with visual padding.
+
+    Click's plain ``confirm`` interleaves with the trailing line of any
+    prior Rich output (progress-bar frames, status spinners), making the
+    `[y/N]` glyphs hard to spot — users have walked past it and approved
+    a $14 bill thinking they were still in cost-estimate territory. A
+    blank line + horizontal rule cleanly separates the prompt from
+    whatever was printed above it.
+    """
+    console.line()
+    console.rule(style="yellow")
+    return click.confirm(message, default=False)
 
 
 def _offer_hook_install(
@@ -116,93 +148,9 @@ def _resolve_embedder(embedder_flag: str | None) -> str:
         return "gemini"
     if os.environ.get("OPENAI_API_KEY"):
         return "openai"
+    if os.environ.get("OPENROUTER_API_KEY"):
+        return "openrouter"
     return "mock"
-
-
-def _register_mcp_with_claude(console_obj: Any, repo_path: Path) -> None:
-    """Register the repowise MCP server and hooks with Claude Desktop and Claude Code."""
-    from repowise.cli.mcp_config import (
-        install_claude_code_hooks,
-        register_with_claude_code,
-        register_with_claude_desktop,
-    )
-
-    desktop = register_with_claude_desktop(repo_path)
-    if desktop:
-        console_obj.print(f"  [green]✓[/green] Claude Desktop MCP registered ({desktop})")
-
-    code = register_with_claude_code(repo_path)
-    if code:
-        console_obj.print(f"  [green]✓[/green] Claude Code MCP registered ({code})")
-
-    hooks = install_claude_code_hooks()
-    if hooks:
-        console_obj.print(
-            f"  [green]✓[/green] Claude Code hooks registered (PreToolUse + PostToolUse)"
-        )
-
-
-def _maybe_generate_claude_md(
-    console_obj: Any,
-    repo_path: Path,
-    *,
-    no_claude_md: bool = False,
-) -> None:
-    """Generate CLAUDE.md if enabled in config and not opted out."""
-    cfg = load_config(repo_path)
-    enabled = cfg.get("editor_files", {}).get("claude_md", True)
-    if no_claude_md:
-        # Persist opt-out so 'repowise update' respects it
-        ef_cfg = dict(cfg.get("editor_files", {}))
-        ef_cfg["claude_md"] = False
-        cfg["editor_files"] = ef_cfg
-        try:
-            import yaml  # type: ignore[import-untyped]
-
-            cfg_path = repo_path / ".repowise" / "config.yaml"
-            cfg_path.write_text(
-                yaml.dump(cfg, default_flow_style=False, sort_keys=False),
-                encoding="utf-8",
-            )
-        except ImportError:
-            pass
-        return
-    if not enabled:
-        return
-    try:
-        with console_obj.status("  Generating .claude/CLAUDE.md…", spinner="dots"):
-            run_async(_write_claude_md_async(repo_path))
-        console_obj.print("  [green]✓[/green] .claude/CLAUDE.md updated")
-    except Exception as exc:
-        console_obj.print(f"  [yellow].claude/CLAUDE.md skipped: {exc}[/yellow]")
-
-
-async def _write_claude_md_async(repo_path: Path) -> None:
-    """Fetch data from DB and write CLAUDE.md (async helper)."""
-    from repowise.cli.helpers import get_db_url_for_repo
-    from repowise.core.generation.editor_files import ClaudeMdGenerator, EditorFileDataFetcher
-    from repowise.core.persistence import (
-        create_engine,
-        create_session_factory,
-        get_session,
-        init_db,
-    )
-    from repowise.core.persistence.crud import get_repository_by_path
-
-    url = get_db_url_for_repo(repo_path)
-    engine = create_engine(url)
-    await init_db(engine)
-    sf = create_session_factory(engine)
-    try:
-        async with get_session(sf) as session:
-            repo = await get_repository_by_path(session, str(repo_path))
-            if repo is None:
-                return  # Not indexed yet — skip silently
-            fetcher = EditorFileDataFetcher(session, repo.id, repo_path)
-            data = await fetcher.fetch()
-    finally:
-        await engine.dispose()
-    ClaudeMdGenerator().write(repo_path, data)
 
 
 # ---------------------------------------------------------------------------
@@ -245,11 +193,29 @@ async def _persist_result(
             name=result.repo_name,
             local_path=str(repo_path),
         )
+        # Persist the detected tech stack into the repository's settings
+        # blob. Merge into any pre-existing settings so we don't clobber
+        # unrelated state (workspace flags, etc.). Done here rather than
+        # in upsert_repository so the persistence helper stays
+        # signature-stable.
+        if getattr(result, "tech_stack", None):
+            import json as _json
+
+            try:
+                existing = _json.loads(repo.settings_json or "{}")
+                if not isinstance(existing, dict):
+                    existing = {}
+            except Exception:
+                existing = {}
+            existing["tech_stack"] = result.tech_stack
+            repo.settings_json = _json.dumps(existing)
         await persist_pipeline_result(result, session, repo.id)
 
         # Record a completed GenerationJob so the web UI can show
         # "last synced" / "last re-indexed" timestamps.
-        from datetime import datetime, UTC as _UTC
+        from datetime import UTC as _UTC
+        from datetime import datetime
+
         from repowise.core.persistence.crud import upsert_generation_job
 
         now = datetime.now(_UTC)
@@ -290,6 +256,9 @@ def _run_workspace_generation(
     skip_tests: bool,
     skip_infra: bool,
     test_run: bool,
+    reasoning: str = "auto",
+    onboarding: bool = True,
+    coverage_pct: float | None = None,
 ) -> list[Any]:
     """Run LLM generation for a single repo in the workspace init flow.
 
@@ -298,20 +267,28 @@ def _run_workspace_generation(
     workspace run.
     """
     from repowise.cli.cost_estimator import build_generation_plan, estimate_cost
-    from repowise.cli.ui import BRAND, RichProgressCallback
+    from repowise.cli.helpers import get_db_url_for_repo
+    from repowise.cli.ui import RichProgressCallback
     from repowise.core.generation import GenerationConfig
     from repowise.core.generation.cost_tracker import CostTracker
-    from repowise.core.persistence.vector_store import InMemoryVectorStore
-    from repowise.core.providers.embedding.base import MockEmbedder
-    from repowise.core.pipeline import run_generation
-    from repowise.cli.helpers import get_db_url_for_repo
     from repowise.core.persistence import (
         create_engine as _ce,
+    )
+    from repowise.core.persistence import (
         create_session_factory as _csf,
+    )
+    from repowise.core.persistence import (
         get_session as _gs,
+    )
+    from repowise.core.persistence import (
         init_db as _idb,
+    )
+    from repowise.core.persistence import (
         upsert_repository as _ur,
     )
+    from repowise.core.persistence.vector_store import InMemoryVectorStore
+    from repowise.core.pipeline import run_generation
+    from repowise.core.providers.embedding.base import MockEmbedder
 
     # Build embedder
     embedder_impl: Any
@@ -342,25 +319,97 @@ def _run_workspace_generation(
     except ImportError:
         vector_store = InMemoryVectorStore(embedder_impl)
 
-    # Cost estimate
-    gen_config = GenerationConfig(max_concurrency=concurrency)
-    plans = build_generation_plan(
-        result.parsed_files, result.graph_builder, gen_config, skip_tests, skip_infra
+    # Coverage chooser — interactive when TTY, falls back to the
+    # ``coverage`` flag (or the default of 20%) for non-TTY / CI runs.
+    # Computes per-option counts + costs from the live ingestion data
+    # so the table never lies about what generation will produce.
+    from repowise.cli.cost_estimator import compute_coverage_options
+    from repowise.cli.coverage_select import interactive_coverage_select
+
+    gen_config = GenerationConfig(
+        max_concurrency=concurrency,
+        reasoning=resolve_reasoning(reasoning),
+        enable_onboarding=onboarding,
     )
-    est = estimate_cost(plans, provider.provider_name, provider.model_name)
+    use_interactive_coverage = (
+        sys.stdin.isatty() and coverage_pct is None and not yes
+    )
+    if use_interactive_coverage:
+        options = compute_coverage_options(
+            parsed_files=result.parsed_files,
+            graph_builder=result.graph_builder,
+            base_config=gen_config,
+            provider_name=provider.provider_name,
+            model_name=provider.model_name,
+            repo_path=repo_path,
+            skip_tests=skip_tests,
+            skip_infra=skip_infra,
+        )
+        chosen = interactive_coverage_select(console, options)
+        chosen_pct = chosen.pct
+        plans = chosen.plans
+        est = chosen.estimate
+    else:
+        chosen_pct = coverage_pct if coverage_pct is not None else gen_config.coverage_pct
+        from dataclasses import replace as _replace
+
+        gen_config_for_plan = _replace(
+            gen_config, coverage_pct=chosen_pct, max_pages_pct=chosen_pct
+        )
+        plans = build_generation_plan(
+            result.parsed_files,
+            result.graph_builder,
+            gen_config_for_plan,
+            skip_tests,
+            skip_infra,
+        )
+        est = estimate_cost(
+            plans,
+            provider.provider_name,
+            provider.model_name,
+            repo_path=repo_path,
+        )
+
+    # Bake the chosen coverage into the gen_config that runs generation,
+    # so the page generator's selection layer honors the user's pick.
+    from dataclasses import replace as _replace_cfg
+
+    gen_config = _replace_cfg(
+        gen_config, coverage_pct=chosen_pct, max_pages_pct=chosen_pct
+    )
+
+    if est.cost_range is not None:
+        cost_str = (
+            f"${est.cost_range.low:.2f} - ${est.cost_range.high:.2f} USD "
+            f"(median ${est.estimated_cost_usd:.2f})"
+        )
+        if est.is_calibrated:
+            cost_str += " [calibrated]"
+    else:
+        cost_str = f"${est.estimated_cost_usd:.2f} USD"
 
     console.print(
-        f"    Estimated tokens: ~{est.estimated_input_tokens + est.estimated_output_tokens:,} "
-        f"(${est.estimated_cost_usd:.2f} USD, {est.total_pages} pages)"
+        f"    Coverage: {int(chosen_pct * 100)}% / "
+        f"~{est.estimated_input_tokens + est.estimated_output_tokens:,} tokens "
+        f"({cost_str}, {est.total_pages} pages)"
     )
 
     if (
         est.estimated_cost_usd > 2.00
         and not yes
-        and not click.confirm(f"    Cost for {repo_path.name} exceeds $2.00. Continue?")
+        and not _confirm_cost_gate(
+            f"    Cost for {repo_path.name} exceeds $2.00. Continue?"
+        )
     ):
-        console.print("    [yellow]Skipped.[/yellow]")
-        return []
+        console.print(
+            "    [yellow]Skipped.[/yellow] "
+            "[dim]Index will be saved without docs; "
+            "future `repowise update` runs default to index-only.[/dim]"
+        )
+        # Sentinel — caller treats this exactly like an index-only run so
+        # state.docs_enabled lands as False and the post-commit hook
+        # doesn't surprise the user with LLM regen later.
+        raise CostGateDeclined()
 
     # Cost tracker (DB-backed when possible)
     from rich.progress import BarColumn, Progress, SpinnerColumn, TextColumn, TimeElapsedColumn
@@ -408,6 +457,7 @@ def _run_workspace_generation(
                 progress=gen_callback,
                 resume=resume,
                 cost_tracker=cost_tracker,
+                generation_config=gen_config,
             )
         )
 
@@ -437,10 +487,13 @@ def _workspace_init(
     skip_infra: bool = False,
     concurrency: int = 5,
     test_run: bool = False,
+    reasoning: str | None = None,
     yes: bool = False,
     dry_run: bool = False,
     resume: bool = False,
     force: bool = False,
+    onboarding: bool = True,
+    coverage_pct: float | None = None,
 ) -> None:
     """Multi-repo workspace initialization.
 
@@ -458,13 +511,18 @@ def _workspace_init(
     try:
         import structlog
 
-        structlog.configure(wrapper_class=structlog.make_filtering_bound_logger(logging.ERROR))
+        # cache_logger_on_first_use=False: see init_command for rationale —
+        # otherwise module-level ``structlog.get_logger`` calls hold a logger
+        # snapshotted before configure() and bypass this filter.
+        structlog.configure(
+            wrapper_class=structlog.make_filtering_bound_logger(logging.ERROR),
+            cache_logger_on_first_use=False,
+        )
     except ImportError:
         pass
 
     from rich.progress import BarColumn, Progress, SpinnerColumn, TextColumn, TimeElapsedColumn
 
-    from repowise.cli.mcp_config import save_mcp_config, save_root_mcp_config
     from repowise.cli.ui import (
         BRAND,
         RichProgressCallback,
@@ -478,7 +536,7 @@ def _workspace_init(
         load_dotenv,
         print_banner,
     )
-    from repowise.core.pipeline import run_pipeline
+    from repowise.core.pipeline import PhaseTimingRecorder, run_pipeline
     from repowise.core.workspace import RepoEntry, WorkspaceConfig
 
     start = time.monotonic()
@@ -530,6 +588,7 @@ def _workspace_init(
             if adv.get("exclude"):
                 exclude_patterns = list(exclude_patterns) + list(adv["exclude"])
             test_run = adv.get("test_run", test_run)
+            reasoning = adv.get("reasoning") or reasoning
             embedder_name_resolved = _resolve_embedder(adv.get("embedder") or embedder_name)
         elif not index_only:
             # "full" mode
@@ -538,15 +597,24 @@ def _workspace_init(
             )
 
     # Resolve provider once (shared across all repos for generation)
+    primary_cfg = load_config(primary_repo.path)
+    resolved_reasoning = resolve_reasoning(reasoning, primary_cfg)
     provider = None
     if not index_only:
         try:
             provider = resolve_provider(provider_name, model, primary_repo.path)
+            # Re-resolve the embedder now that interactive_provider_select
+            # may have set the provider's API key in os.environ. Without
+            # this, full-mode runs would display "mock" forever because
+            # the initial resolution happened before the key was available.
+            embedder_name_resolved = _resolve_embedder(embedder_name)
             console.print(
                 f"  Provider: [cyan]{provider.provider_name}[/cyan] / "
                 f"Model: [cyan]{provider.model_name}[/cyan]"
             )
             console.print(f"  Embedder: [cyan]{embedder_name_resolved}[/cyan]\n")
+            if resolved_reasoning != "auto":
+                console.print(f"  Reasoning: [cyan]{resolved_reasoning}[/cyan]\n")
         except Exception as exc:
             console.print(f"  [yellow]Provider setup failed ({exc}); falling back to index-only.[/yellow]")
             index_only = True
@@ -576,6 +644,16 @@ def _workspace_init(
     total_symbols = 0
     total_pages = 0
     errors: list[tuple[str, str]] = []
+    # Per-repo docs outcome, surfaced in the completion panel so the user
+    # never has to guess why the web UI is missing pages for some repos.
+    # Maps alias -> (generated_count, skip_reason | None)
+    docs_outcomes: dict[str, tuple[int, str | None]] = {}
+    editor_options = resolve_editor_setup_options(
+        console,
+        disabled_project_files=get_default_disabled_project_files(
+            no_claude_md=no_claude_md,
+        ),
+    )
 
     for i, repo in enumerate(selected, 1):
         console.print(
@@ -592,7 +670,7 @@ def _workspace_init(
                 TimeElapsedColumn(),
                 console=console,
             ) as progress_bar:
-                callback = RichProgressCallback(progress_bar, console)
+                callback = PhaseTimingRecorder(RichProgressCallback(progress_bar, console))
 
                 result = run_async(
                     run_pipeline(
@@ -605,6 +683,7 @@ def _workspace_init(
                         progress=callback,
                     )
                 )
+            repo_phase_timings: dict[str, float] = callback.timings
 
             total_files += result.file_count
             total_symbols += result.symbol_count
@@ -618,10 +697,20 @@ def _workspace_init(
             console.print(f"    [red]\u2717 Failed: {exc}[/red]\n")
             continue
 
-        # Generation phase (per-repo, only when not index-only)
+        # Generation phase (per-repo, only when not index-only).
+        # Track per-repo whether the user declined cost so state.docs_enabled
+        # reflects the actual choice instead of the original init mode.
+        repo_docs_enabled = not index_only and provider is not None
+        skip_reason: str | None = None
+        if index_only:
+            skip_reason = "index-only mode"
+        elif provider is None:
+            skip_reason = "no provider configured"
         if not index_only and provider is not None:
             if dry_run:
                 console.print("    [yellow]Dry run — skipping generation for this repo.[/yellow]\n")
+                skip_reason = "dry run"
+                repo_docs_enabled = False
             else:
                 try:
                     generated_pages = _run_workspace_generation(
@@ -635,16 +724,30 @@ def _workspace_init(
                         skip_tests=skip_tests,
                         skip_infra=skip_infra,
                         test_run=test_run,
+                        reasoning=resolved_reasoning,
+                        onboarding=onboarding,
+                        coverage_pct=coverage_pct,
                     )
                     result.generated_pages = generated_pages
                     total_pages += len(generated_pages)
                     console.print(
                         f"    [green]\u2713[/green] Generated {len(generated_pages)} pages\n"
                     )
+                except CostGateDeclined:
+                    repo_docs_enabled = False
+                    result.generated_pages = []
+                    skip_reason = "cost gate declined"
                 except Exception as gen_exc:
                     console.print(f"    [yellow]Generation failed: {gen_exc}[/yellow]\n")
+                    skip_reason = f"generation error: {gen_exc}"
+                    repo_docs_enabled = False
         else:
             console.print()
+
+        docs_outcomes[repo.alias] = (
+            len(result.generated_pages or []),
+            None if repo_docs_enabled else skip_reason,
+        )
 
         # Persist to repo-local DB
         run_async(_persist_result(result, repo.path))
@@ -655,10 +758,13 @@ def _workspace_init(
         state: dict[str, Any] = {
             "last_sync_commit": head,
             "total_pages": pages_count,
+            "docs_enabled": repo_docs_enabled,
         }
-        if not index_only and provider is not None:
+        if repo_docs_enabled and provider is not None:
             state["provider"] = provider.provider_name
             state["model"] = provider.model_name
+        if repo_phase_timings:
+            state["phase_timings"] = repo_phase_timings
         save_state(repo.path, state)
 
         # Update workspace config with indexing metadata
@@ -669,10 +775,12 @@ def _workspace_init(
             entry.indexed_at = datetime.now(timezone.utc).isoformat()
             entry.last_commit_at_index = head
 
-        # MCP config + CLAUDE.md per repo
-        save_mcp_config(repo.path)
-        save_root_mcp_config(repo.path)
-        _maybe_generate_claude_md(console, repo.path, no_claude_md=no_claude_md)
+        # MCP config + editor setup files per repo
+        write_editor_project_files(
+            console,
+            repo.path,
+            options=editor_options,
+        )
 
         # Persist provider/model config per-repo when doing full generation
         if not index_only and provider is not None:
@@ -683,6 +791,7 @@ def _workspace_init(
                 embedder_name_resolved,
                 exclude_patterns=exclude_patterns if exclude_patterns else None,
                 commit_limit=resolved_commit_limit,
+                reasoning=resolved_reasoning,
             )
 
     # Save workspace config with updated timestamps
@@ -703,11 +812,11 @@ def _workspace_init(
         except Exception as exc:
             console.print(f"  [yellow]⚠ Cross-repo analysis failed: {exc}[/yellow]")
 
-    # Step 6: Register MCP for primary repo with Claude
+    # Step 6: Register primary repo with configured editor clients
     primary_entry = ws_config.get_primary()
     if primary_entry:
         primary_path = (root / primary_entry.path).resolve()
-        _register_mcp_with_claude(console, primary_path)
+        register_editor_clients(console, primary_path)
 
     # Step 7: Completion summary
     elapsed = time.monotonic() - start
@@ -743,6 +852,35 @@ def _workspace_init(
     )
     console.print()
 
+    # Honest docs status — print a per-repo summary listing exactly which
+    # repos generated pages and which were skipped, so the user never has
+    # to discover empty Docs/Overview in the web UI on their own.
+    docs_skipped = [
+        (alias, reason) for alias, (count, reason) in docs_outcomes.items() if reason
+    ]
+    docs_generated = [
+        (alias, count) for alias, (count, reason) in docs_outcomes.items() if not reason
+    ]
+    if docs_outcomes:
+        console.print("[bold]Docs status[/bold]")
+        for alias, (count, reason) in docs_outcomes.items():
+            if reason:
+                console.print(
+                    f"  [yellow]✗[/yellow] {alias:<20} [yellow]skipped[/yellow]  [dim]({reason})[/dim]"
+                )
+            else:
+                console.print(
+                    f"  [green]✓[/green] {alias:<20} [green]{count} pages[/green]"
+                )
+        if docs_skipped:
+            first = docs_skipped[0][0]
+            console.print()
+            console.print(
+                f"  Run [bold]repowise update --repo {first} --docs[/bold] "
+                "to generate docs for a skipped repo."
+            )
+        console.print()
+
     # Offer to install post-commit hooks
     indexed_repos = [
         repo for repo in selected
@@ -768,7 +906,10 @@ def _workspace_init(
     "--provider",
     "provider_name",
     default=None,
-    help="LLM provider name (anthropic, openai, gemini, ollama, mock).",
+    help=(
+        "LLM provider name (anthropic, openai, openrouter, gemini, "
+        "deepseek, ollama, litellm, mock)."
+    ),
 )
 @click.option("--model", default=None, help="Model identifier override.")
 @click.option(
@@ -789,6 +930,12 @@ def _workspace_init(
     "--force", is_flag=True, default=False, help="Regenerate all pages, ignoring existing."
 )
 @click.option("--concurrency", type=int, default=5, help="Max concurrent LLM calls.")
+@click.option(
+    "--reasoning",
+    type=click.Choice(["auto", "off", "minimal"]),
+    default=None,
+    help="Reasoning mode for supported providers: auto, off, or minimal. Default: auto.",
+)
 @click.option(
     "--test-run",
     is_flag=True,
@@ -840,6 +987,29 @@ def _workspace_init(
     default=False,
     help="In multi-repo mode, index all detected repos without prompting.",
 )
+@click.option(
+    "--onboarding/--no-onboarding",
+    "onboarding",
+    default=True,
+    help=(
+        "Generate the curated Onboarding collection (Project Overview, "
+        "Architecture Guide, Getting Started, Codebase Map, Key Concepts, "
+        "How It Works, Development Guide, Active Landscape). Default: on. "
+        "Slots with insufficient signal are skipped automatically."
+    ),
+)
+@click.option(
+    "--coverage",
+    "coverage_pct",
+    type=float,
+    default=None,
+    metavar="PCT",
+    help=(
+        "Documentation coverage as a fraction of repo files (e.g. 0.10, 0.20, "
+        "0.50). Bypasses the interactive coverage chooser. Default when "
+        "interactive: prompt; otherwise 0.20."
+    ),
+)
 def init_command(
     path: str | None,
     provider_name: str | None,
@@ -852,6 +1022,7 @@ def init_command(
     resume: bool,
     force: bool,
     concurrency: int,
+    reasoning: str | None,
     test_run: bool,
     index_only: bool,
     exclude: tuple[str, ...],
@@ -860,6 +1031,8 @@ def init_command(
     no_claude_md: bool,
     include_submodules: bool,
     init_all: bool,
+    onboarding: bool,
+    coverage_pct: float | None,
 ) -> None:
     """Generate wiki documentation for a codebase.
 
@@ -912,11 +1085,14 @@ def init_command(
             skip_tests=skip_tests,
             skip_infra=skip_infra,
             concurrency=concurrency,
+            reasoning=reasoning,
             test_run=test_run,
             yes=yes,
             dry_run=dry_run,
             resume=resume,
             force=force,
+            onboarding=onboarding,
+            coverage_pct=coverage_pct,
         )
         return
 
@@ -939,8 +1115,14 @@ def init_command(
     try:
         import structlog
 
+        # Without cache_logger_on_first_use=False, modules that called
+        # ``structlog.get_logger(__name__)`` at import time hold a bound logger
+        # snapshotted before this configure ran — so debug lines from
+        # ``core/ingestion/*`` (graph, traverser, parser, …) would leak past
+        # the ERROR filter on the first ``init`` of a session.
         structlog.configure(
             wrapper_class=structlog.make_filtering_bound_logger(logging.ERROR),
+            cache_logger_on_first_use=False,
         )
     except ImportError:
         pass
@@ -967,16 +1149,26 @@ def init_command(
             skip_tests = adv["skip_tests"]
             skip_infra = adv["skip_infra"]
             concurrency = adv["concurrency"]
+            reasoning = adv.get("reasoning") or reasoning
             exclude = adv["exclude"]
             test_run = adv["test_run"]
             embedder_name = adv.get("embedder") or embedder_name
             include_submodules = adv.get("include_submodules", include_submodules)
-            no_claude_md = adv.get("no_claude_md", no_claude_md)
         else:
             provider_name, model = interactive_provider_select(console, model, repo_path=repo_path)
 
+    editor_options = resolve_editor_setup_options(
+        console,
+        disabled_project_files=get_default_disabled_project_files(
+            no_claude_md=no_claude_md,
+        ),
+        prompt_for_project_files=is_interactive and not index_only,
+    )
+
     # Merge exclude_patterns from config.yaml and --exclude/-x flags
     config = load_config(repo_path)
+    language = config.get("language", "en")
+    resolved_reasoning = resolve_reasoning(reasoning, config)
     exclude_patterns: list[str] = list(config.get("exclude_patterns") or []) + list(exclude)
 
     # Resolve commit limit: CLI flag → config.yaml → default (500)
@@ -1032,28 +1224,49 @@ def init_command(
             provider_name, model = _ips(console, model)
 
         provider = resolve_provider(provider_name, model, repo_path)
+        # resolve_provider / interactive_provider_select may have just set
+        # the API key in os.environ. Re-resolve the embedder so the
+        # display (and the embed path below) honors the key the user just
+        # pasted, rather than the pre-prompt "mock" fallback.
+        embedder_name_resolved = _resolve_embedder(embedder_name)
         if not is_interactive:
             console.print(f"[bold]repowise init[/bold] — {repo_path}")
         console.print(
             f"  Provider: [cyan]{provider.provider_name}[/cyan] / Model: [cyan]{provider.model_name}[/cyan]"
         )
         console.print(f"  Embedder: [cyan]{embedder_name_resolved}[/cyan]")
+        if language != "en":
+            console.print(f"  Language: [cyan]{language}[/cyan]")
+        if resolved_reasoning != "auto":
+            console.print(f"  Reasoning: [cyan]{resolved_reasoning}[/cyan]")
 
         # Validate provider connection
         from repowise.core.providers.llm.base import ProviderError
 
         with console.status("  Verifying provider connection…", spinner="dots"):
             try:
-                run_async(provider.generate("You are a test.", "Reply with OK.", max_tokens=50))
+                run_async(
+                    provider.generate(
+                        "You are a test.",
+                        "Reply with OK.",
+                        max_tokens=50,
+                        reasoning=resolved_reasoning,
+                    )
+                )
             except ProviderError as exc:
                 raise click.ClickException(f"Provider validation failed: {exc}") from exc
         console.print("  [green]✓[/green] Provider connection verified")
 
     # ---- Phase 1 & 2: Ingestion + Analysis (always) ----
     total_phases = 3 if index_only else 4
+    # Tracks whether the user declined the LLM cost gate. When True we
+    # skip generation but still persist the index/graph/git/dead-code so
+    # the run isn't wasted, and propagate the choice to state.docs_enabled
+    # so subsequent updates default to index-only.
+    cost_declined = False
     llm_client = provider if not index_only else decision_provider
 
-    from repowise.core.pipeline import run_pipeline
+    from repowise.core.pipeline import PhaseTimingRecorder, run_pipeline
 
     with Progress(
         SpinnerColumn(),
@@ -1064,7 +1277,11 @@ def init_command(
         TextColumn("[green]${task.fields[cost]:.3f}[/green]"),
         console=console,
     ) as progress_bar:
-        callback = RichProgressCallback(progress_bar, console)
+        rich_callback = RichProgressCallback(progress_bar, console)
+        # Wrap the Rich callback so we can record per-phase wall-clock
+        # durations without changing the pipeline API. Timings get
+        # persisted to state.json below.
+        callback = PhaseTimingRecorder(rich_callback)
 
         # Always run ingestion + analysis first (generate_docs=False).
         # Generation happens separately after cost confirmation.
@@ -1084,6 +1301,11 @@ def init_command(
                 progress=callback,
             )
         )
+
+    # Surface per-phase timing data to the caller — both for the
+    # state.json persistence below and for any future "profile" tooling
+    # that wants to introspect a run.
+    phase_timings: dict[str, float] = callback.timings
 
     # ---- Analysis summary (shown between analysis and generation) ----
     _graph = result.graph_builder.graph()
@@ -1147,14 +1369,60 @@ def init_command(
             f"Generating wiki pages with {provider.provider_name} / {provider.model_name}",
         )
 
-        # Cost estimation
+        # Cost estimation + coverage selection. The coverage chooser
+        # is rendered interactively when stdin is a TTY and no explicit
+        # ``--coverage`` flag was passed; otherwise the configured
+        # percentage drives a single non-interactive estimate.
+        from dataclasses import replace as _replace_cfg
+        from repowise.cli.cost_estimator import compute_coverage_options
+        from repowise.cli.coverage_select import interactive_coverage_select
         from repowise.core.generation import GenerationConfig
 
-        gen_config = GenerationConfig(max_concurrency=concurrency)
-        plans = build_generation_plan(
-            result.parsed_files, result.graph_builder, gen_config, skip_tests, skip_infra
+        gen_config = GenerationConfig(
+            max_concurrency=concurrency,
+            language=language,
+            reasoning=resolved_reasoning,
+            enable_onboarding=onboarding,
         )
-        est = estimate_cost(plans, provider.provider_name, provider.model_name)
+        if sys.stdin.isatty() and coverage_pct is None and not yes:
+            options = compute_coverage_options(
+                parsed_files=result.parsed_files,
+                graph_builder=result.graph_builder,
+                base_config=gen_config,
+                provider_name=provider.provider_name,
+                model_name=provider.model_name,
+                repo_path=repo_path,
+                skip_tests=skip_tests,
+                skip_infra=skip_infra,
+            )
+            chosen = interactive_coverage_select(console, options)
+            chosen_pct = chosen.pct
+            plans = chosen.plans
+            est = chosen.estimate
+        else:
+            chosen_pct = (
+                coverage_pct if coverage_pct is not None else gen_config.coverage_pct
+            )
+            gen_config_for_plan = _replace_cfg(
+                gen_config, coverage_pct=chosen_pct, max_pages_pct=chosen_pct
+            )
+            plans = build_generation_plan(
+                result.parsed_files,
+                result.graph_builder,
+                gen_config_for_plan,
+                skip_tests,
+                skip_infra,
+            )
+            est = estimate_cost(
+                plans,
+                provider.provider_name,
+                provider.model_name,
+                repo_path=repo_path,
+            )
+
+        gen_config = _replace_cfg(
+            gen_config, coverage_pct=chosen_pct, max_pages_pct=chosen_pct
+        )
 
         table = Table(title="Generation Plan", border_style=BRAND)
         table.add_column("Page Type", style="cyan")
@@ -1173,132 +1441,171 @@ def init_command(
             lang_parts = [f"{lang} {pct:.0%}" for lang, pct in lang_items]
             console.print(f"  Languages: {', '.join(lang_parts)}")
 
+        if est.cost_range is not None:
+            cost_str = (
+                f"${est.cost_range.low:.2f} - ${est.cost_range.high:.2f} USD "
+                f"(median ${est.estimated_cost_usd:.2f})"
+            )
+            if est.is_calibrated:
+                cost_str += " [calibrated]"
+        else:
+            cost_str = f"${est.estimated_cost_usd:.2f} USD"
+
         console.print(
-            f"  Estimated tokens: ~{est.estimated_input_tokens + est.estimated_output_tokens:,} "
-            f"(${est.estimated_cost_usd:.2f} USD)"
+            f"  Coverage: {int(chosen_pct * 100)}% / "
+            f"~{est.estimated_input_tokens + est.estimated_output_tokens:,} tokens "
+            f"({cost_str})"
         )
+        if onboarding:
+            console.print(
+                "  [cyan]Onboarding collection:[/cyan] "
+                "[dim]up to 8 curated pages — Project Overview, Architecture Guide, "
+                "Getting Started, Codebase Map, Key Concepts, How It Works, "
+                "Development Guide, Active Landscape "
+                "(slots without enough signal are skipped).[/dim]"
+            )
+        else:
+            console.print("  [dim]Onboarding collection: disabled (--no-onboarding).[/dim]")
         console.print()
 
         if dry_run:
             console.print("[yellow]Dry run — no pages generated.[/yellow]")
             return
 
-        if (
+        cost_declined = (
             est.estimated_cost_usd > 2.00
             and not yes
-            and not click.confirm("  Estimated cost exceeds $2.00. Continue?")
-        ):
-            console.print("[yellow]Aborted.[/yellow]")
-            return
-
-        # Build embedder + vector store
-        from repowise.core.persistence.vector_store import InMemoryVectorStore
-        from repowise.core.providers.embedding.base import MockEmbedder
-
-        embedder_impl: Any
-        if embedder_name_resolved == "gemini":
-            try:
-                from repowise.core.providers.embedding.gemini import GeminiEmbedder
-
-                embedder_impl = GeminiEmbedder()
-            except Exception:
-                embedder_impl = MockEmbedder()
-        elif embedder_name_resolved == "openai":
-            try:
-                from repowise.core.providers.embedding.openai import OpenAIEmbedder
-
-                embedder_impl = OpenAIEmbedder()
-            except Exception:
-                embedder_impl = MockEmbedder()
-        else:
-            embedder_impl = MockEmbedder()
-
-        lance_dir = repo_path / ".repowise" / "lancedb"
-        try:
-            from repowise.core.persistence.vector_store import LanceDBVectorStore
-
-            lance_dir.mkdir(parents=True, exist_ok=True)
-            vector_store: Any = LanceDBVectorStore(str(lance_dir), embedder=embedder_impl)
-        except ImportError:
-            vector_store = InMemoryVectorStore(embedder_impl)
-
-        # Run generation via the pipeline's generation function
-        from repowise.core.pipeline import run_generation
-
-        with Progress(
-            SpinnerColumn(),
-            TextColumn("[progress.description]{task.description}"),
-            BarColumn(),
-            MaybeCountColumn(),
-            TimeElapsedColumn(),
-            TextColumn("[green]${task.fields[cost]:.3f}[/green]"),
-            console=console,
-        ) as gen_progress:
-            gen_callback = RichProgressCallback(gen_progress, console)
-
-            # Construct a CostTracker backed by the real DB so every LLM call
-            # is persisted to the llm_costs table.  We need the repo_id from the
-            # database row that was created/upserted during _persist_result
-            # (which has not run yet), so we look it up or fall back to in-memory.
-            from repowise.core.generation.cost_tracker import CostTracker
-            from repowise.cli.helpers import get_db_url_for_repo
-            from repowise.core.persistence import (
-                create_engine as _create_engine,
-                create_session_factory as _create_sf,
-                get_session as _get_session,
-                init_db as _init_db,
-                upsert_repository as _upsert_repo,
+            and not _confirm_cost_gate("  Estimated cost exceeds $2.00. Continue?")
+        )
+        if cost_declined:
+            console.print(
+                "[yellow]Skipped LLM generation.[/yellow] "
+                "[dim]Index/graph/git/dead-code will be saved; future "
+                "`repowise update` runs default to index-only so the "
+                "post-commit hook won't trigger LLM regen.[/dim]"
             )
 
-            async def _make_cost_tracker() -> CostTracker:
-                url = get_db_url_for_repo(repo_path)
-                engine = _create_engine(url)
-                await _init_db(engine)
-                sf = _create_sf(engine)
-                async with _get_session(sf) as _sess:
-                    _repo = await _upsert_repo(
-                        _sess,
-                        name=result.repo_name,
-                        local_path=str(repo_path),
-                    )
-                    _repo_id = _repo.id
-                # Keep engine alive for the duration of generation — it will be
-                # disposed by _persist_result's own engine later.
-                return CostTracker(session_factory=sf, repo_id=_repo_id)
+        if not cost_declined:
+            # Build embedder + vector store
+            from repowise.core.persistence.vector_store import InMemoryVectorStore
+            from repowise.core.providers.embedding.base import MockEmbedder
 
+            embedder_impl: Any
+            if embedder_name_resolved == "gemini":
+                try:
+                    from repowise.core.providers.embedding.gemini import GeminiEmbedder
+
+                    embedder_impl = GeminiEmbedder()
+                except Exception:
+                    embedder_impl = MockEmbedder()
+            elif embedder_name_resolved == "openai":
+                try:
+                    from repowise.core.providers.embedding.openai import OpenAIEmbedder
+
+                    embedder_impl = OpenAIEmbedder()
+                except Exception:
+                    embedder_impl = MockEmbedder()
+            else:
+                embedder_impl = MockEmbedder()
+
+            lance_dir = repo_path / ".repowise" / "lancedb"
             try:
-                cost_tracker = run_async(_make_cost_tracker())
-            except Exception:
-                # Fallback to in-memory tracker if DB setup fails
-                cost_tracker = CostTracker()
+                from repowise.core.persistence.vector_store import LanceDBVectorStore
 
-            # Attach tracker to provider unconditionally (all providers now
-            # accept _cost_tracker as an attribute)
-            provider._cost_tracker = cost_tracker
+                lance_dir.mkdir(parents=True, exist_ok=True)
+                vector_store: Any = LanceDBVectorStore(str(lance_dir), embedder=embedder_impl)
+            except ImportError:
+                vector_store = InMemoryVectorStore(embedder_impl)
 
-            generated_pages = run_async(
-                run_generation(
-                    repo_path=repo_path,
-                    parsed_files=result.parsed_files,
-                    source_map=result.source_map,
-                    graph_builder=result.graph_builder,
-                    repo_structure=result.repo_structure,
-                    git_meta_map=result.git_meta_map,
-                    llm_client=provider,
-                    embedder=embedder_impl,
-                    vector_store=vector_store,
-                    concurrency=concurrency,
-                    progress=gen_callback,
-                    resume=resume,
-                    cost_tracker=cost_tracker,
+            # Run generation via the pipeline's generation function
+            from repowise.core.pipeline import run_generation
+
+            with Progress(
+                SpinnerColumn(),
+                TextColumn("[progress.description]{task.description}"),
+                BarColumn(),
+                MaybeCountColumn(),
+                TimeElapsedColumn(),
+                TextColumn("[green]${task.fields[cost]:.3f}[/green]"),
+                console=console,
+            ) as gen_progress:
+                gen_callback = RichProgressCallback(gen_progress, console)
+
+                # Construct a CostTracker backed by the real DB so every LLM call
+                # is persisted to the llm_costs table.  We need the repo_id from the
+                # database row that was created/upserted during _persist_result
+                # (which has not run yet), so we look it up or fall back to in-memory.
+                from repowise.cli.helpers import get_db_url_for_repo
+                from repowise.core.generation.cost_tracker import CostTracker
+                from repowise.core.persistence import (
+                    create_engine as _create_engine,
                 )
-            )
+                from repowise.core.persistence import (
+                    create_session_factory as _create_sf,
+                )
+                from repowise.core.persistence import (
+                    get_session as _get_session,
+                )
+                from repowise.core.persistence import (
+                    init_db as _init_db,
+                )
+                from repowise.core.persistence import (
+                    upsert_repository as _upsert_repo,
+                )
 
-        result.generated_pages = generated_pages
-        console.print(f"  [green]✓[/green] Generated [bold]{len(generated_pages)}[/bold] pages")
+                async def _make_cost_tracker() -> CostTracker:
+                    url = get_db_url_for_repo(repo_path)
+                    engine = _create_engine(url)
+                    await _init_db(engine)
+                    sf = _create_sf(engine)
+                    async with _get_session(sf) as _sess:
+                        _repo = await _upsert_repo(
+                            _sess,
+                            name=result.repo_name,
+                            local_path=str(repo_path),
+                        )
+                        _repo_id = _repo.id
+                    # Keep engine alive for the duration of generation — it will be
+                    # disposed by _persist_result's own engine later.
+                    return CostTracker(session_factory=sf, repo_id=_repo_id)
+
+                try:
+                    cost_tracker = run_async(_make_cost_tracker())
+                except Exception:
+                    # Fallback to in-memory tracker if DB setup fails
+                    cost_tracker = CostTracker()
+
+                # Attach tracker to provider unconditionally (all providers now
+                # accept _cost_tracker as an attribute)
+                provider._cost_tracker = cost_tracker
+
+                generated_pages = run_async(
+                    run_generation(
+                        repo_path=repo_path,
+                        parsed_files=result.parsed_files,
+                        source_map=result.source_map,
+                        graph_builder=result.graph_builder,
+                        repo_structure=result.repo_structure,
+                        git_meta_map=result.git_meta_map,
+                        llm_client=provider,
+                        embedder=embedder_impl,
+                        vector_store=vector_store,
+                        concurrency=concurrency,
+                        progress=gen_callback,
+                        resume=resume,
+                        cost_tracker=cost_tracker,
+                        generation_config=gen_config,
+                    )
+                )
+
+            result.generated_pages = generated_pages
+            console.print(f"  [green]✓[/green] Generated [bold]{len(generated_pages)}[/bold] pages")
 
     # ---- Persistence ----
-    if index_only:
+    # `cost_declined` short-circuits any further LLM work for the rest of
+    # this run, so persistence/state below treat it as index-only.
+    effective_index_only = index_only or cost_declined
+    if effective_index_only:
         print_phase_header(console, 3, total_phases, "Persistence", "Saving to database")
     else:
         print_phase_header(
@@ -1309,7 +1616,24 @@ def init_command(
         run_async(_persist_result(result, repo_path))
     console.print("  [green]✓[/green] Database updated")
 
-    # ---- Post-run: config, state, MCP, CLAUDE.md ----
+    # Persist the onboarding choice so subsequent `repowise update` runs
+    # honor it without re-passing the flag. Default True is omitted to keep
+    # config files tidy — only the override is recorded.
+    if not onboarding:
+        cfg = load_config(repo_path)
+        cfg["enable_onboarding"] = False
+        try:
+            import yaml  # type: ignore[import-untyped]
+
+            cfg_path = repo_path / ".repowise" / "config.yaml"
+            cfg_path.write_text(
+                yaml.dump(cfg, default_flow_style=False, sort_keys=False),
+                encoding="utf-8",
+            )
+        except ImportError:
+            pass
+
+    # ---- Post-run: config, state, MCP, editor project files ----
     if commit_limit is not None:
         cfg = load_config(repo_path)
         cfg["commit_limit"] = resolved_commit_limit
@@ -1324,16 +1648,29 @@ def init_command(
         except ImportError:
             pass
 
-    from repowise.cli.mcp_config import save_mcp_config, save_root_mcp_config
+    write_editor_project_files(
+        console,
+        repo_path,
+        options=editor_options,
+    )
+    register_editor_clients(console, repo_path)
 
-    save_mcp_config(repo_path)
-    save_root_mcp_config(repo_path)
-    _register_mcp_with_claude(console, repo_path)
-
-    _maybe_generate_claude_md(console, repo_path, no_claude_md=no_claude_md)
+    # ---- State (always) ----
+    # Even in index-only mode we persist `last_sync_commit` so that a
+    # subsequent `repowise update` (e.g. fired by the post-commit hook) has
+    # a baseline to diff against. Without this, index-only users hit
+    # "No previous sync found" on every update.
+    head = get_head_commit(repo_path)
+    base_state = load_state(repo_path)
+    base_state["last_sync_commit"] = head
+    base_state["docs_enabled"] = not effective_index_only and provider is not None
+    if phase_timings:
+        base_state["phase_timings"] = phase_timings
+    if effective_index_only or provider is None:
+        save_state(repo_path, base_state)
 
     # ---- State + config (full mode only) ----
-    if not index_only and provider:
+    if not effective_index_only and provider:
 
         async def _count_db_pages() -> int:
             from sqlalchemy import func as sa_func
@@ -1369,8 +1706,11 @@ def init_command(
         state["total_pages"] = run_async(_count_db_pages())
         state["provider"] = provider.provider_name
         state["model"] = provider.model_name
+        state["docs_enabled"] = True
         total_tokens = sum(p.total_tokens for p in (result.generated_pages or []))
         state["total_tokens"] = total_tokens
+        if phase_timings:
+            state["phase_timings"] = phase_timings
         save_state(repo_path, state)
 
         save_config(
@@ -1380,6 +1720,7 @@ def init_command(
             embedder_name_resolved,
             exclude_patterns=exclude_patterns if exclude_patterns else None,
             commit_limit=resolved_commit_limit if commit_limit is not None else None,
+            reasoning=resolved_reasoning,
         )
 
     # ---- Completion panel ----
@@ -1427,7 +1768,7 @@ def init_command(
     else:
         _lang_summary_final = str(len(result.languages))
 
-    if index_only:
+    if effective_index_only:
         metrics: list[tuple[str, str]] = [
             ("Files indexed", str(result.file_count)),
             ("Symbols", f"{result.symbol_count:,}"),

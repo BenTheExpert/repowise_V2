@@ -2,6 +2,19 @@
 
 Complete reference for all `repowise` commands. For a guided introduction, see the [Quickstart](QUICKSTART.md).
 
+## Workspace auto-detect (cross-cutting)
+
+Most commands auto-detect whether you're in a workspace root and route accordingly. When auto-detection fires, the command prints a one-line `[workspace] …` notice. You can always override:
+
+| Flag | Effect |
+|------|--------|
+| `--workspace` / `-w` | Force workspace mode. Errors if no `.repowise-workspace.yaml` is found. |
+| `--no-workspace` | Force single-repo mode even when invoked from a workspace root. |
+| `--repo <alias>` | Scope a workspace command to one repo. Available on commands where it makes sense. |
+| `--all` | Fan out across every workspace repo (on `costs`, `search`). |
+
+The commands that grew these flags in v0.8.x: `update`, `status`, `watch`, `doctor`, `costs`, `search`, `dead-code`, `decision`, `generate-claude-md`, `hook install/status/uninstall`.
+
 ---
 
 ## Core Commands
@@ -37,7 +50,7 @@ In workspace mode, adds: repo scanning, per-repo indexing, cross-repo analysis (
 
 | Flag | Description |
 |------|-------------|
-| `--provider` | LLM provider: `anthropic`, `openai`, `gemini`, `ollama`, `mock` |
+| `--provider` | LLM provider: `anthropic`, `openai`, `openrouter`, `gemini`, `deepseek`, `ollama`, `litellm`, `mock` |
 | `--model` | Model name override (e.g., `claude-sonnet-4-6`) |
 | `--embedder` | Embedder for semantic search: `gemini`, `openai`, `mock` |
 | `--index-only` | Skip LLM generation. Only parse, build graph, and index git. Free. |
@@ -48,6 +61,7 @@ In workspace mode, adds: repo scanning, per-repo indexing, cross-repo analysis (
 | `--exclude / -x` | Gitignore-style exclusion patterns. Repeatable. |
 | `--include-submodules` | Include git submodule directories. |
 | `--concurrency` | Max concurrent LLM calls (default: 5). |
+| `--reasoning` | Reasoning mode for supported providers: `auto`, `off`, or `minimal` (default: `auto`). |
 | `--resume` | Resume from the last checkpoint if interrupted. |
 | `--force` | Regenerate all pages even if they exist. |
 | `--commit-limit` | Max commits to analyze per file (default: 500). |
@@ -63,6 +77,8 @@ repowise init --provider anthropic --yes              # automated
 repowise init --index-only                            # free, no LLM
 repowise init --dry-run                               # preview cost
 repowise init --test-run                              # quick test (10 files)
+repowise init --provider openai --model qwen3 --reasoning off
+repowise init --provider openrouter --model openai/gpt-5 --reasoning minimal
 repowise init -x vendor/ -x "*.gen.go"               # exclude patterns
 repowise init --include-submodules                    # include submodules
 repowise init .                                       # workspace mode
@@ -82,10 +98,14 @@ Incrementally update wiki pages for files changed since the last sync.
 | `--provider` | Override LLM provider for this run |
 | `--model` | Override model |
 | `--since` | Git ref to diff from (overrides `state.json`) |
+| `--reasoning` | Reasoning mode for supported providers: `auto`, `off`, or `minimal` |
 | `--cascade-budget` | Max pages to regenerate (default: auto) |
 | `--dry-run` | Show what would be updated without regenerating |
 | `--workspace` | Update all stale repos in the workspace + cross-repo analysis |
+| `--no-workspace` | Force single-repo mode (handy when running from a workspace root) |
 | `--repo` | Update a specific workspace repo by alias |
+
+**First-time indexing:** as of v0.8, `update --workspace` now runs full first-time indexing for workspace entries that have no `.repowise/` dir yet (previously skipped with `"not_indexed"`). The pipeline runs index-only — no LLM cost — and writes a state.json marker so `repowise update --repo <alias> --docs` later picks up doc generation cleanly.
 
 **Examples:**
 
@@ -93,8 +113,10 @@ Incrementally update wiki pages for files changed since the last sync.
 repowise update                        # diff since last sync
 repowise update --dry-run              # preview
 repowise update --since v1.0.0         # diff from a tag
-repowise update --workspace            # all workspace repos
+repowise update --reasoning off        # one-off supported-provider thinking-off run
+repowise update --workspace            # all workspace repos (incl. first-time indexing)
 repowise update --repo backend         # specific workspace repo
+repowise update --no-workspace         # force single-repo mode in a workspace root
 ```
 
 ---
@@ -112,12 +134,22 @@ Start the API server and web UI.
 | `--workers` | Uvicorn workers (default: 1) |
 | `--ui-port` | Web UI port (default: 3000) |
 | `--no-ui` | Start API server only |
+| `--refresh-ui` | Force re-download of the web UI tarball, ignoring any cache |
 
 ```bash
 repowise serve                           # API + Web UI
 repowise serve --no-ui                   # API only
 repowise serve --port 8080 --ui-port 8081
+repowise serve --refresh-ui              # bypass cache, pull latest UI tarball
 ```
+
+**Web UI sources, in order of precedence:**
+
+1. **Local monorepo build** at `packages/web/.next/standalone/...` — used when the CLI is run from inside a checkout. The bundle's mtime is compared against source under `packages/web/`, `packages/ui/src/`, and `packages/types/src/`; if any source is newer the bundle is rebuilt with `npm run build` (or skipped if `npm` is unavailable).
+2. **Cached download** at `~/.repowise/web/`, keyed by the CLI version in `.version`.
+3. **Fresh download** of `repowise-web.tar.gz` from the GitHub release matching the CLI version.
+
+Pass `--refresh-ui` to skip (1) and (2) and force (3).
 
 ---
 
@@ -133,11 +165,14 @@ Watch for file changes and auto-update wiki pages. Press `Ctrl+C` to stop.
 | `--model` | Model override |
 | `--debounce` | Delay in ms after last change (default: 2000) |
 | `--workspace` | Watch all workspace repos |
+| `--no-workspace` | Force single-repo mode |
+| `--repo` | Watch a single workspace repo by alias |
 
 ```bash
-repowise watch                           # single repo
+repowise watch                           # single repo (auto-detects)
 repowise watch --debounce 5000           # 5s debounce
 repowise watch --workspace               # all workspace repos
+repowise watch --repo backend            # just one
 ```
 
 ---
@@ -154,11 +189,16 @@ Search wiki pages by keyword, meaning, or symbol name.
 |------|-------------|
 | `--mode` | `fulltext` (default), `semantic`, `symbol` |
 | `--limit` | Max results (default: 10) |
+| `--repo` | Scope to a specific workspace repo by alias |
+| `--all` | Fan out across every workspace repo and merge results |
+| `--workspace` / `--no-workspace` | Force workspace / single-repo mode |
 
 ```bash
 repowise search "rate limiting"
 repowise search "how are errors handled" --mode semantic
 repowise search "AuthService" --mode symbol
+repowise search "rate limit" --repo backend     # workspace, one repo
+repowise search "rate limit" --all              # workspace, fan-out
 ```
 
 ---
@@ -179,9 +219,12 @@ repowise query "what files handle payment processing?"
 Show wiki sync state, page statistics, and coverage.
 
 ```bash
-repowise status                          # single repo
+repowise status                          # auto-detects mode
 repowise status --workspace              # all workspace repos
+repowise status --no-workspace           # force single-repo even in a workspace
 ```
+
+In workspace mode, the table includes a **Docs** column with each repo's page count and a per-repo **Docs status** block listing skip reasons (e.g. `cost gate declined`) and the exact remediation command.
 
 ---
 
@@ -201,13 +244,51 @@ Detect dead and unused code.
 | `--format` | Output: `table` (default), `json`, `md` |
 | `--include-internals` | Include private/underscore symbols |
 | `--include-zombie-packages` | Include unused declared packages |
+| `--repo` | In workspace mode, target a specific repo (defaults to primary) |
+| `--workspace` / `--no-workspace` | Force workspace / single-repo mode |
 
 ```bash
 repowise dead-code
 repowise dead-code --safe-only --min-confidence 0.8
 repowise dead-code --format json
+repowise dead-code --repo backend        # workspace, single repo
 repowise dead-code resolve <id>          # mark resolved / false positive
 ```
+
+---
+
+### `repowise health [PATH]`
+
+Compute per-file code-health scores from twelve deterministic biomarkers (CCN, nesting, brain methods, duplication, untested hotspots, organizational risk). Zero LLM calls — pure Python over tree-sitter + git data. See [`docs/CODE_HEALTH.md`](./CODE_HEALTH.md) for the user guide and [`docs/architecture/code-health.md`](./architecture/code-health.md) for the internals.
+
+**Options:**
+
+| Flag | Description |
+|------|-------------|
+| `--file <path>` | Deep-dive a single file (relative path) |
+| `--module <prefix>` | Restrict the report to files whose path starts with this prefix |
+| `--refactoring-targets` | Print top refactoring candidates ranked by impact / effort |
+| `--trend` | Print the last 10 health snapshots + any active alerts (declining / predicted decline) |
+| `--coverage <path>` | Ingest a coverage report (LCOV / Cobertura / Clover). Repeat for multiple files |
+| `--coverage-format` | Override coverage-format auto-detection: `lcov`, `cobertura`, `clover` |
+| `--format` | Output: `table` (default), `json`, `md` |
+| `--safe-only` | Confidence ≥ 0.8 only (placeholder for v1 biomarkers) |
+| `--repo` | In workspace mode, target a specific repo (defaults to primary) |
+| `--no-workspace` | Force single-repo mode |
+
+```bash
+repowise health                                       # KPIs + lowest-scoring files
+repowise health --file packages/server/.../app.py     # one file in detail
+repowise health --module packages/server              # restrict to a directory
+repowise health --refactoring-targets                 # ranked by impact / effort
+repowise health --trend                               # snapshot history + alerts
+repowise health --coverage coverage.lcov              # ingest coverage
+repowise health --format json | jq .kpis              # machine-readable
+```
+
+`repowise init` and `repowise update` populate the health tables automatically —
+no separate command needed. `repowise status` shows a one-line summary
+(`Health: 7.4 (avg) · 6.2 (hotspots) · 2.1 (worst: <path>)`).
 
 ---
 
@@ -242,11 +323,20 @@ repowise decision health [PATH]         # health dashboard
 
 Show LLM spend tracking.
 
+| Flag | Description |
+|------|-------------|
+| `--by` | Grouping: `operation`, `model`, `day` |
+| `--repo` | Scope to a specific workspace repo |
+| `--all` | Aggregate across every workspace repo |
+| `--workspace` / `--no-workspace` | Force workspace / single-repo mode |
+
 ```bash
-repowise costs                           # total spend
+repowise costs                           # auto-detects mode
 repowise costs --by operation            # grouped by operation
 repowise costs --by model                # grouped by model
 repowise costs --by day                  # grouped by day
+repowise costs --all                     # workspace-wide aggregate
+repowise costs --repo backend            # one workspace repo
 ```
 
 ---
@@ -261,8 +351,20 @@ Show all repos in the workspace with their index status.
 
 Add a new repo to an existing workspace and index it.
 
+**As of v0.8 this defaults to `--index --docs`** when a provider is configured — the added repo is indexed and gets LLM doc generation in one step, with a cost-gate prompt before any tokens are spent. Pass `--no-docs` to skip generation, or `--no-index` to only register the entry. The provider, model, embedder, and exclude patterns are inherited from the primary repo's `.repowise/config.yaml` unless overridden.
+
+| Flag | Description |
+|------|-------------|
+| `--alias` | Short name for the repo (defaults to directory name) |
+| `--index` / `--no-index` | Run the index pipeline (default: on) |
+| `--docs` / `--no-docs` | Run LLM doc generation (default: on when a provider is configured) |
+| `--provider` / `--model` | Override the inherited provider/model |
+| `--primary` | Mark this repo as the workspace default |
+
 ```bash
 repowise workspace add ../new-service --alias api-gateway
+repowise workspace add ../mobile --no-docs            # index, no LLM
+repowise workspace add ../shared --no-index           # register only
 ```
 
 ### `repowise workspace remove <alias>`
@@ -381,11 +483,18 @@ repowise reindex --embedder gemini --batch-size 50
 
 ### `repowise doctor [PATH]`
 
-Run health checks on the wiki setup.
+Run health checks on the wiki setup. Auto-detects workspace mode; in workspace mode runs a workspace-level table (directory exists, git repo, state.json ↔ workspace config drift) followed by the per-repo check battery for every indexed entry.
+
+| Flag | Description |
+|------|-------------|
+| `--repair` | Repair detected issues: rebuild FTS, re-embed missing pages, sync drifted workspace state, drop dead workspace entries |
+| `--workspace` / `--no-workspace` | Force workspace / single-repo mode |
 
 ```bash
-repowise doctor
-repowise doctor --repair    # fix detected store mismatches
+repowise doctor                          # auto-detects
+repowise doctor --repair                 # fix detected store mismatches
+repowise doctor --workspace              # every workspace repo
+repowise doctor --workspace --repair     # also drop dead entries / sync drift
 ```
 
 ---

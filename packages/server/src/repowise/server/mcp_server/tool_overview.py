@@ -8,6 +8,10 @@ from typing import Any
 
 from sqlalchemy import func as sa_func, select
 
+from repowise.core.persistence.crud import (
+    get_health_metrics as _get_health_metrics,
+    get_health_summary as _get_health_summary,
+)
 from repowise.core.persistence.database import get_session
 from repowise.core.persistence.models import (
     GitMetadata,
@@ -21,6 +25,7 @@ from repowise.server.mcp_server._helpers import (
     _resolve_all_contexts,
     _resolve_repo_context,
 )
+from repowise.server.mcp_server._meta import build_meta as _build_meta
 from repowise.server.mcp_server._server import mcp
 
 
@@ -42,19 +47,27 @@ async def _workspace_overview() -> dict:
         async with get_session(ctx.session_factory) as session:
             repo_obj = await _get_repo(session)
 
-            # One-line summary from repo_overview page
+            # One-line summary from repo_overview page. Same multi-row
+            # safety as the single-repo path below.
             ov_result = await session.execute(
-                select(Page.content).where(
+                select(Page.content)
+                .where(
                     Page.repository_id == repo_obj.id,
                     Page.page_type == "repo_overview",
                 )
+                .order_by(
+                    (Page.target_path == repo_obj.name).desc(),
+                    Page.updated_at.desc(),
+                )
             )
-            ov_content = ov_result.scalar_one_or_none() or ""
+            ov_content = ov_result.scalars().first() or ""
             summary = ov_content.split("\n")[0].strip("# ").strip()[:200] if ov_content else ""
 
             # File and symbol counts
             file_count_res = await session.execute(
-                select(sa_func.count()).select_from(GraphNode).where(
+                select(sa_func.count())
+                .select_from(GraphNode)
+                .where(
                     GraphNode.repository_id == repo_obj.id,
                     GraphNode.node_type == "file",
                 )
@@ -62,7 +75,9 @@ async def _workspace_overview() -> dict:
             file_count = file_count_res.scalar_one()
 
             symbol_count_res = await session.execute(
-                select(sa_func.count()).select_from(GraphNode).where(
+                select(sa_func.count())
+                .select_from(GraphNode)
+                .where(
                     GraphNode.repository_id == repo_obj.id,
                     GraphNode.node_type == "symbol",
                 )
@@ -72,19 +87,18 @@ async def _workspace_overview() -> dict:
             total_files += file_count
             total_symbols += symbol_count
 
-            is_default = (
-                registry is not None
-                and ctx.alias == registry.get_default_alias()
-            )
+            is_default = registry is not None and ctx.alias == registry.get_default_alias()
 
-            repos_info.append({
-                "alias": ctx.alias,
-                "path": str(ctx.path),
-                "summary": summary,
-                "file_count": file_count,
-                "symbol_count": symbol_count,
-                "is_default": is_default,
-            })
+            repos_info.append(
+                {
+                    "alias": ctx.alias,
+                    "path": str(ctx.path),
+                    "summary": summary,
+                    "file_count": file_count,
+                    "symbol_count": symbol_count,
+                    "is_default": is_default,
+                }
+            )
 
     # Cross-repo topology (Phase 3 + 4)
     cross_repo_topology: dict[str, Any] = {}
@@ -97,9 +111,7 @@ async def _workspace_overview() -> dict:
         for repo_info in repos_info:
             deps = enricher.get_package_deps(repo_info["alias"])
             if deps:
-                repo_info["depends_on"] = sorted(
-                    set(d["target_repo"] for d in deps)
-                )
+                repo_info["depends_on"] = sorted(set(d["target_repo"] for d in deps))
 
     result: dict[str, Any] = {
         "workspace": True,
@@ -108,10 +120,7 @@ async def _workspace_overview() -> dict:
         "total_files": total_files,
         "total_symbols": total_symbols,
         "repos": repos_info,
-        "hint": (
-            "Use repo='<alias>' to query a specific repo. "
-            "Omit repo to use the default."
-        ),
+        "hint": ("Use repo='<alias>' to query a specific repo. Omit repo to use the default."),
     }
     if cross_repo_topology:
         result["cross_repo_topology"] = cross_repo_topology
@@ -131,9 +140,7 @@ def _build_workspace_footer() -> dict | None:
         return None
 
     default_alias = registry.get_default_alias()
-    other_repos = [
-        a for a in registry.get_all_aliases() if a != default_alias
-    ]
+    other_repos = [a for a in registry.get_all_aliases() if a != default_alias]
     if not other_repos:
         return None
 
@@ -161,16 +168,19 @@ def _build_workspace_footer() -> dict | None:
 
 @mcp.tool()
 async def get_overview(repo: str | None = None) -> dict:
-    """Get the repository overview: architecture summary, module map, key entry points.
+    """Architecture map for an unfamiliar repo — first call when you don't know your way around.
 
-    Best first call when starting to explore an unfamiliar codebase.
+    Returns the synthesised overview plus key modules, entry points, repo-wide
+    git health (hotspot count, churn trend, bus-factor distribution), the
+    knowledge map (top owners, knowledge silos), and the community summary.
+    Skip this on subsequent calls — once you have the map, jump straight to
+    ``get_context`` / ``get_answer``.
 
     In workspace mode:
-    - Omit ``repo`` for the default repo overview (includes workspace context,
-      cross-repo co-changes, package dependencies, and API contract links).
-    - Use ``repo="all"`` for a workspace-level summary of all repos including
-      cross-repo topology and contract links (HTTP routes, gRPC services, topics).
-    - Use ``repo="<alias>"`` to query a specific repo.
+    - Omit ``repo`` for the default repo's overview plus a workspace footer.
+    - ``repo="all"`` returns the cross-repo topology (co-changes, package deps,
+      API contracts) — no single-repo detail.
+    - ``repo="<alias>"`` targets one specific repo.
 
     Args:
         repo: Repository alias, path, or ID. Use ``"all"`` for workspace overview.
@@ -182,14 +192,24 @@ async def get_overview(repo: str | None = None) -> dict:
     async with get_session(ctx.session_factory) as session:
         repository = await _get_repo(session)
 
-        # Get repo overview page
+        # Get repo overview page. Older indexes occasionally left a stale
+        # row with target_path='repo' alongside the canonical
+        # target_path=<repo_name> row, so prefer the row matching the repo
+        # name and fall back to the most recently updated one. Using
+        # scalar_one_or_none here would crash with MultipleResultsFound on
+        # those legacy DBs.
         result = await session.execute(
-            select(Page).where(
+            select(Page)
+            .where(
                 Page.repository_id == repository.id,
                 Page.page_type == "repo_overview",
             )
+            .order_by(
+                (Page.target_path == repository.name).desc(),
+                Page.updated_at.desc(),
+            )
         )
-        overview_page = result.scalar_one_or_none()
+        overview_page = result.scalars().first()
 
         # Get module pages
         result = await session.execute(
@@ -288,8 +308,12 @@ async def get_overview(repo: str | None = None) -> dict:
             # knowledge_silos: files where primary owner has > 80% ownership
             # Filter out boilerplate (migrations, __init__.py, config, lock files)
             silo_exclude_patterns = (
-                "alembic/versions/", "__init__.py", "migrations/",
-                ".lock", "package-lock", "conftest.py",
+                "alembic/versions/",
+                "__init__.py",
+                "migrations/",
+                ".lock",
+                "package-lock",
+                "conftest.py",
             )
             knowledge_silos = [
                 g.file_path
@@ -332,9 +356,7 @@ async def get_overview(repo: str | None = None) -> dict:
         # Sort communities by size descending, take top 10
         # Skip communities with generic/unhelpful labels
         generic_labels = {"packages", "src", "lib", "core", "app", ""}
-        for cid, members in sorted(
-            community_groups.items(), key=lambda x: -len(x[1])
-        ):
+        for cid, members in sorted(community_groups.items(), key=lambda x: -len(x[1])):
             if len(community_summary) >= 10:
                 break
             label = ""
@@ -365,16 +387,54 @@ async def get_overview(repo: str | None = None) -> dict:
                 else:
                     display_label = f"cluster_{cid}"
 
-            community_summary.append({
-                "id": cid,
-                "label": display_label,
-                "size": len(members),
-                "cohesion": round(cohesion, 3),
-            })
+            community_summary.append(
+                {
+                    "id": cid,
+                    "label": display_label,
+                    "size": len(members),
+                    "cohesion": round(cohesion, 3),
+                }
+            )
+
+        # Older indexes persisted titles like "Repository Overview: repo" because
+        # repo_name was not passed through to generate_repo_overview. Substitute
+        # the actual repo name back in so the response is useful without reindex.
+        if overview_page:
+            persisted_title = overview_page.title or ""
+            title = persisted_title.replace(
+                "Repository Overview: repo", f"Repository Overview: {repository.name}"
+            )
+        else:
+            title = repository.name
+        # Code-health KPIs — three headline numbers for the architecture
+        # summary. Falls back to defaults (avg 10/10, no worst file) when
+        # health hasn't been run on this repo yet.
+        code_health: dict[str, Any] = {}
+        try:
+            health_summary = await _get_health_summary(session, repository.id)
+            metrics_rows = await _get_health_metrics(session, repository.id)
+            if metrics_rows:
+                # Hotspot health: NLOC-weighted avg over the top-25% files
+                # by NLOC, matching the dashboard KPI definition.
+                sorted_by_nloc = sorted(metrics_rows, key=lambda m: m.nloc or 0, reverse=True)
+                top_q = sorted_by_nloc[: max(1, len(sorted_by_nloc) // 4)]
+                tot = sum(max(m.nloc, 1) for m in top_q)
+                hotspot_avg = sum(m.score * max(m.nloc, 1) for m in top_q) / tot if tot else 10.0
+                code_health = {
+                    "average_health": health_summary["average_health"],
+                    "hotspot_health": round(hotspot_avg, 2),
+                    "worst_performer_path": health_summary["worst_performer_path"],
+                    "worst_performer_score": health_summary["worst_performer_score"],
+                    "open_findings": health_summary["open_findings"],
+                    "file_count": health_summary["file_count"],
+                }
+        except Exception:
+            code_health = {}
 
         result = {
-            "title": overview_page.title if overview_page else repository.name,
+            "title": title,
             "content_md": overview_page.content if overview_page else "No overview generated yet.",
+            "code_health": code_health,
             "key_modules": [
                 {
                     "name": p.title,
@@ -398,4 +458,5 @@ async def get_overview(repo: str | None = None) -> dict:
         if ws_footer:
             result["workspace"] = ws_footer
 
+        result["_meta"] = _build_meta(repository=repository)
         return result

@@ -1,20 +1,26 @@
 import type { Metadata } from "next";
 import Link from "next/link";
 import { notFound } from "next/navigation";
+import { ApiClientError } from "@/lib/api/client";
 import { getRepo } from "@/lib/api/repos";
 import { getPageById, getPageVersions } from "@/lib/api/pages";
 import { getGitMetadata } from "@/lib/api/git";
 import { getGraphMetrics } from "@/lib/api/graph";
-import { ConfidenceBadge } from "@/components/wiki/confidence-badge";
+import { ConfidenceBadge } from "@repowise-dev/ui/wiki/confidence-badge";
 import { WikiRenderer } from "@/components/wiki/wiki-renderer";
-import { TableOfContents } from "@/components/wiki/table-of-contents";
-import { RegenerateButton } from "@/components/wiki/regenerate-button";
-import { GitHistoryPanel } from "@/components/wiki/git-history-panel";
-import { SecurityPanel } from "@/components/wiki/security-panel";
-import { Badge } from "@/components/ui/badge";
-import { Separator } from "@/components/ui/separator";
-import { formatRelativeTime, formatTokens } from "@/lib/utils/format";
-import { CoChangeList } from "@/components/git/co-change-list";
+import { TableOfContents } from "@repowise-dev/ui/wiki/table-of-contents";
+import { RegenerateButtonWrapper } from "@/components/wiki/regenerate-button";
+import { GitHistoryPanel } from "@repowise-dev/ui/wiki/git-history-panel";
+import { SecurityPanelWrapper } from "@/components/wiki/security-panel";
+import { BacklinksPanel } from "@repowise-dev/ui/wiki/backlinks-panel";
+import {
+  getBacklinks,
+  getWikiLinks,
+} from "@repowise-dev/ui/wiki/wiki-links-types";
+import { Badge } from "@repowise-dev/ui/ui/badge";
+import { Separator } from "@repowise-dev/ui/ui/separator";
+import { formatRelativeTime, formatTokens } from "@repowise-dev/ui/lib/format";
+import { CoChangeList } from "@repowise-dev/ui/git/co-change-list";
 import { Hash, Cpu, StickyNote, Network } from "lucide-react";
 import type { GraphMetricsResponse } from "@/lib/api/types";
 
@@ -40,8 +46,11 @@ export default async function WikiPageRoute({ params }: Props) {
   let page;
   try {
     page = await getPageById(pageId);
-  } catch {
-    notFound();
+  } catch (err) {
+    if (err instanceof ApiClientError && err.status === 404) {
+      notFound();
+    }
+    throw err;
   }
 
   const [repo, versions, gitMeta, graphMetricsResult] = await Promise.allSettled([
@@ -98,7 +107,7 @@ export default async function WikiPageRoute({ params }: Props) {
           )}
 
           {/* Regenerate */}
-          <RegenerateButton pageId={page.id} repoId={id} />
+          <RegenerateButtonWrapper pageId={page.id} repoId={id} />
         </div>
 
         {/* Page content */}
@@ -122,7 +131,11 @@ export default async function WikiPageRoute({ params }: Props) {
           )}
 
           <article className="prose prose-invert max-w-none leading-relaxed overflow-hidden">
-            <WikiRenderer content={page.content} />
+            <WikiRenderer
+              content={page.content}
+              wikiLinks={getWikiLinks(page.metadata)}
+              repoId={id}
+            />
           </article>
 
           {/* Hallucination warnings */}
@@ -237,13 +250,21 @@ export default async function WikiPageRoute({ params }: Props) {
             </div>
           )}
 
+          {/* Backlinks — pages mentioning this one. Hidden when empty
+              so legacy pages without interlinking metadata don't show
+              an awkward "Linked by (0)" header. */}
+          <BacklinksPanel
+            backlinks={getBacklinks(page.metadata)}
+            repoId={id}
+          />
+
           {/* Security findings panel */}
           {page.target_path && (
             <div>
               <p className="text-xs font-medium text-[var(--color-text-tertiary)] uppercase tracking-wider mb-2">
                 Security Signals
               </p>
-              <SecurityPanel repoId={id} filePath={page.target_path} />
+              <SecurityPanelWrapper repoId={id} filePath={page.target_path} />
             </div>
           )}
 

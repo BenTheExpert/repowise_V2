@@ -36,20 +36,25 @@ call resolution, named bindings, heritage extraction, and docstrings.
 | Language | Extensions | Entry Points | Import Style |
 |----------|-----------|-------------|-------------|
 | **Python** | `.py` `.pyi` | `main.py` `app.py` `__main__.py` `manage.py` `wsgi.py` `asgi.py` | `import x` / `from x import y` |
-| **TypeScript** | `.ts` `.tsx` | `index.ts` `main.ts` `app.ts` `server.ts` | `import { x } from 'y'` / `require()` |
+| **TypeScript** | `.ts` `.tsx` | `index.ts` `main.ts` `app.ts` `server.ts` | `import { x } from 'y'` / `require()` with tsconfig path aliases, npm/yarn/pnpm `workspaces`, and optional `.vue`/`.svelte`/`.astro` SFC probing |
 | **JavaScript** | `.js` `.jsx` `.mjs` `.cjs` | `index.js` `main.js` `app.js` `server.js` | `import` / `require()` |
 | **Java** | `.java` | `Main.java` `Application.java` | `import pkg.Class` |
-| **Go** | `.go` | `main.go` `cmd/main.go` | `import "path"` with `go.mod` resolution |
+| **Go** | `.go` | `main.go` `cmd/main.go` | `import "path"` with multi-module `go.mod` discovery (longest-prefix match) |
 | **Rust** | `.rs` | `main.rs` `lib.rs` | `use crate::` / `use super::` / `use self::` with `Cargo.toml` |
 | **C++** | `.cpp` `.cc` `.cxx` `.h` `.hpp` `.hxx` | `main.cpp` `main.cc` | `#include` with `compile_commands.json` resolution |
+| **C#** | `.cs` | `Program.cs` `Startup.cs` | `using Acme.Domain` / `global using` / `using static` / `using Alias = X.Y.Z` with `.csproj` / `.sln` / `Directory.Build.props` resolution |
 
-All seven languages support:
+All eight languages support:
 - Tree-sitter AST parsing with dedicated `.scm` query files
 - Three-tier call resolution (same-file, cross-file, global stem match)
 - Named binding extraction (mapping imported names to source symbols)
-- Heritage extraction (class/interface/trait inheritance chains)
-- Docstring extraction (Python, JSDoc, GoDoc, Rustdoc, Javadoc, Doxygen)
-- Framework-aware edges (Django, FastAPI, Flask for Python; tsconfig path aliases for TS/JS; pytest fixture detection)
+- Heritage extraction (class/interface/trait/record inheritance chains)
+- Docstring extraction (Python, JSDoc, GoDoc, Rustdoc, Javadoc, Doxygen, XML doc)
+- Framework-aware edges (Django, FastAPI, Flask for Python; tsconfig path aliases for TS/JS; pytest fixture detection; ASP.NET controllers / minimal API / EF Core DbContext for C#; Spring Boot DI + `@Bean` factories for Java/Kotlin; Rails routes + ActiveRecord relationships; Laravel routes + service providers + Eloquent; TYPO3 convention files (`ext_localconf.php`, `Configuration/TCA/*`, `JavaScriptModules.php` registrations) for PHP; Express `app.use(router)` + NestJS `@Module` arrays; Gin/Echo/Chi router → handler files for Go; Axum/Actix `.route` → handler files for Rust)
+- Per-language dynamic-hint extractors (Django/Pytest/Node for Python+JS/TS; .NET DI/Activator/InternalsVisibleTo for C#; Spring `getBean`/`@Bean` factories for Java/Kotlin; Ruby `send`/`const_get`/`define_method`/`delegate`; PHP `call_user_func`/`ReflectionClass`/container `get`; Scala `Class.forName`/`given`/`implicit val`; Swift `NSClassFromString`/`Selector`/`#selector`/KVC; C function-pointer assignment + `dlopen`/`dlsym`; Luau `game:GetService`/`setmetatable __index`; Go `reflect.TypeOf`/`plugin.Open`/`plugin.Lookup`)
+- For C# only: MSBuild project graph (`<ProjectReference>` / `<PackageReference>`), namespace → file mapping across projects, `global using` / `using static` / `using alias` propagation, ASP.NET HTTP and gRPC-dotnet contract extraction in workspace mode, cross-repo `<ProjectReference>` and internal-NuGet detection, host-builder extension method resolution (`app.MapCatalogApi()` / `services.AddCatalogServices()` on any C# repo, not just ASP.NET), `nameof(Type)` references resolved as dynamic uses, local `var x = new T()` property reads bound to the defining file, and CommunityToolkit MVVM source-generator synthesis (`[ObservableProperty]` fields → PascalCase property, `[RelayCommand]` methods → `<Name>Command`)
+- For C/C++ only: visibility tracked from access specifiers (`public:` / `private:` / `protected:`), `static` file-scope storage class, and export attributes (`__declspec(dllexport)`, `__attribute__((visibility("default")))`); COM / I-prefixed bases emit `implements` edges (rest are `extends`); Windows DLL entry points (`DllMain`, `DllGetClassObject`, `DllCanUnloadNow`, `DllRegisterServer`, `DllUnregisterServer`, `DllGetActivationFactory`) are never flagged as dead
+- For XAML only: `<ResourceDictionary Source="..."/>` and `MergedDictionaries` entries resolve across `pack://application:,,,/`, `ms-appx:///`, repo-rooted and relative URIs, emitting xaml→xaml `dynamic_uses` edges
 
 ### Good
 
@@ -61,12 +66,11 @@ resolvers for each language.
 | Language | Extensions | Entry Points | Import Style |
 |----------|-----------|-------------|-------------|
 | **C** | `.c` | `main.c` | `#include` with `compile_commands.json` (shares C++ grammar) |
-| **Kotlin** | `.kt` `.kts` | `Main.kt` `Application.kt` | `import com.example.Foo` |
-| **Ruby** | `.rb` | `main.rb` `app.rb` `config.ru` | `require 'mod'` / `require_relative './mod'` |
-| **C#** | `.cs` | `Program.cs` `Startup.cs` | `using System.Collections.Generic` |
-| **Swift** | `.swift` | `main.swift` `App.swift` | `import Foundation` |
-| **Scala** | `.scala` | `Main.scala` `App.scala` | `import pkg.{A, B => C}` |
-| **PHP** | `.php` | `index.php` `public/index.php` | `use Foo\Bar\Baz` |
+| **Kotlin** | `.kt` `.kts` | `Main.kt` `Application.kt` | `import com.example.Foo` with Gradle `settings.gradle(.kts)` subprojects + `sourceSets` overrides |
+| **Ruby** | `.rb` | `main.rb` `app.rb` `config.ru` | `require 'mod'` / `require_relative './mod'` plus Rails / Zeitwerk autoloading (gated on `config/application.rb`) |
+| **Swift** | `.swift` | `main.swift` `App.swift` | `import Foundation` with SPM `Package.swift` `targets:` → directory mapping |
+| **Scala** | `.scala` | `Main.scala` `App.scala` | `import pkg.{A, B => C}` with SBT `build.sbt` / Mill `build.sc` multi-project parsing |
+| **PHP** | `.php` | `index.php` `public/index.php` | `use Foo\Bar\Baz` with composer.json `autoload.psr-4` longest-prefix resolution |
 
 ### Config / Data
 
@@ -88,13 +92,26 @@ endpoints or targets where applicable.
 | **SQL** | `.sql` | -- |
 | **Shell** | `.sh` `.bash` `.zsh` | -- |
 
+### Partial (Luau — Roblox)
+
+| Language | Extensions | Entry Points | Import Style |
+|----------|-----------|-------------|-------------|
+| **Luau** | `.luau` `.lua` | `init.luau` `init.lua` | `require(script.Parent.X)` / `require(script.X)` / `require(game.Service.Path)` / `require("rel/path")` |
+
+AST parsing, symbol extraction (functions, Luau type aliases), and
+`require(...)` call capture are wired. Import resolution handles string
+literals and `script`/`script.Parent` relative instance paths. Absolute
+Roblox instance paths (`game.<Service>...`) currently register as external
+nodes and are the target of a follow-up that reads Rojo's
+`default.project.json` tree mapping — see issue #52.
+
 ### Git-Blame-Only
 
 These languages are tracked in git history (blame, hotspot analysis,
 co-change detection) but have no AST parsing or dedicated support. Files
 appear in the wiki as traversal-level entries.
 
-Objective-C, Elixir, Erlang, Lua, R, Dart, Zig, Julia, Clojure, Elm,
+Objective-C, Elixir, Erlang, R, Dart, Zig, Julia, Clojure, Elm,
 Haskell, OCaml, F#, Crystal, Nim, D
 
 ---
@@ -264,11 +281,37 @@ No changes are needed to `traverser.py`, `dead_code.py`,
 `page_generator.py`, `cost_estimator.py`, or any other consumer file ---
 they all derive their language sets from the registry automatically.
 
+### Optional language-specific passes
+
+Three pluggable hooks let a language opt into deeper resolution
+without touching the shared pipeline files:
+
+- `graph_warmups.py` --- register a one-time pre-import warmup (e.g.
+  building a project index) so its cost shows up as its own phase
+  instead of inflating `graph.imports`.
+- `type_ref_resolution._STRATEGIES` --- register a strategy that
+  resolves parameter-type captures (`@param.type` in the language's
+  `.scm`) to file-level type-use edges. Drives DI-aware analysis.
+- `languages/<lang>_member_reads.py` --- emit `reads` edges for
+  property / member access. Used today for C# `var x = new T()`
+  locals; the same shape applies to any statically-typed language.
+- `extractors/synthetic_symbols.py` --- recognise source-generator
+  attributes and emit the symbols the generator would produce
+  at compile time. Used today for CommunityToolkit MVVM
+  (`[ObservableProperty]`, `[RelayCommand]`); the same shape fits
+  Java Lombok, Kotlin `@Parcelize`, etc.
+- `extractors/visibility.py::refine_<lang>_visibility` --- node-aware
+  visibility refinement for languages where access is dictated by AST
+  context (C/C++ access specifiers, storage class, export attributes)
+  rather than modifier text alone.
+
 ---
 
 ## Architecture
 
-The language pipeline is fully modular:
+The language pipeline is fully modular. Per-language code lives in
+dedicated subpackages — adding a new language means dropping a file
+into each subpackage rather than editing monoliths.
 
 ```
 ingestion/
@@ -277,8 +320,14 @@ ingestion/
     visibility.py      #   symbol visibility (public/private/protected)
     signatures.py      #   human-readable signature building
     docstrings.py      #   module + symbol docstring extraction
-    bindings.py        #   import name + alias binding extraction
-    heritage.py        #   inheritance/interface/trait extraction
+    bindings/          #   import name + alias binding extraction (per-lang)
+      __init__.py      #     extract_import_bindings dispatcher
+      python.py  ts_js.py  go.py  rust.py  java.py  kotlin.py
+      ruby.py    csharp.py swift.py scala.py php.py cpp.py
+    heritage/          #   inheritance/interface/trait extraction (per-lang)
+      __init__.py      #     extract_heritage + HERITAGE_EXTRACTORS dispatcher
+      python.py  ts_js.py  java.py  go.py    rust.py  cpp.py
+      kotlin.py  ruby.py   swift.py csharp.py scala.py php.py
   resolvers/           # Per-language import resolution
     python.py          #   dotted imports, __init__.py, src/ layout
     typescript.py      #   multi-ext probe, tsconfig aliases
@@ -287,18 +336,33 @@ ingestion/
     cpp.py             #   compile_commands.json include paths
     kotlin.py          #   package-to-directory mapping
     ruby.py            #   require/require_relative resolution
-    csharp.py          #   namespace-based resolution
+    csharp.py / dotnet/ #  namespace-based + MSBuild project graph
     swift.py           #   module import resolution
     scala.py           #   package-to-directory mapping
     php.py             #   namespace/PSR-4 resolution
     generic.py         #   stem-matching fallback
-  framework_edges.py   # Django, FastAPI, Flask, pytest detection
+  framework_edges.py   # Django, FastAPI, Flask, pytest, ASP.NET, Rails, Laravel, TYPO3, Spring, Express, Gin, Axum detection
+  dynamic_hints/       # Per-language dynamic-edge extractors
+    base.py            #   DynamicHintExtractor + DynamicEdge
+    registry.py        #   HintRegistry
+    django.py  pytest_hints.py  node.py  dotnet.py
+    spring.py  ruby.py  php.py  scala.py  swift.py  c.py  luau.py  go.py
   parser.py            # ASTParser (language-agnostic orchestration)
   graph.py             # GraphBuilder (import/call/heritage resolution)
+
+analysis/
+  dead_code/           # Dead code detection (Phase 1 split)
+    __init__.py        #   re-exports DeadCodeAnalyzer + dataclasses
+    analyzer.py        #   DeadCodeAnalyzer class + four detection passes
+    models.py          #   DeadCodeKind, DeadCodeFindingData, DeadCodeReport
+    constants.py       #   never-flag globs, framework decorators, fixtures
+    dynamic_markers.py #   per-language source-text dynamic markers
 ```
 
 Adding a new language requires zero changes to `parser.py`, `graph.py`,
-`traverser.py`, `dead_code.py`, or any other core file.
+`traverser.py`, or any analysis core file. New language work consists of
+adding one file to each per-language subpackage and registering it in the
+relevant `__init__.py` dispatcher / dict.
 
 ---
 

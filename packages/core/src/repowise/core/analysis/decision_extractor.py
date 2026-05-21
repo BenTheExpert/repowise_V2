@@ -722,8 +722,15 @@ class DecisionExtractor:
     # Main entry point
     # ------------------------------------------------------------------
 
-    async def extract_all(self) -> DecisionExtractionReport:
-        """Run all capture sources in parallel. LLM failures are caught per-source."""
+    async def extract_all(
+        self, *, on_step: Any | None = None
+    ) -> DecisionExtractionReport:
+        """Run all capture sources in parallel. LLM failures are caught per-source.
+
+        *on_step* is an optional callable invoked with the source name as
+        each sub-extractor finishes (``inline_marker``, ``git_archaeology``,
+        ``readme_mining``). Used by the CLI to surface per-source progress.
+        """
 
         async def _safe_inline() -> list[ExtractedDecision]:
             try:
@@ -734,6 +741,9 @@ class DecisionExtractor:
             except Exception as exc:
                 logger.warning("decision_extractor.inline_markers_failed", error=str(exc))
                 return []
+            finally:
+                if on_step:
+                    on_step("inline_marker")
 
         async def _safe_git() -> list[ExtractedDecision]:
             try:
@@ -744,6 +754,9 @@ class DecisionExtractor:
             except Exception as exc:
                 logger.warning("decision_extractor.git_archaeology_failed", error=str(exc))
                 return []
+            finally:
+                if on_step:
+                    on_step("git_archaeology")
 
         async def _safe_readme() -> list[ExtractedDecision]:
             try:
@@ -754,6 +767,9 @@ class DecisionExtractor:
             except Exception as exc:
                 logger.warning("decision_extractor.readme_mining_failed", error=str(exc))
                 return []
+            finally:
+                if on_step:
+                    on_step("readme_mining")
 
         logger.info("decision_extractor.extract_all_start")
         inline, git_decisions, readme_decisions = await asyncio.gather(
@@ -791,6 +807,11 @@ class DecisionExtractor:
             dirnames[:] = [
                 d for d in dirnames
                 if d not in _SKIP_DIRS
+                # Skip setuptools build metadata: PKG-INFO embeds the README
+                # verbatim, so example marker lines in docs become spurious
+                # decisions. Same risk for *.dist-info from wheels.
+                and not d.endswith(".egg-info")
+                and not d.endswith(".dist-info")
                 # Skip nested git repositories — they are separate codebases
                 # and should not contribute decisions to the parent repo.
                 and not (Path(dirpath) / d / ".git").exists()

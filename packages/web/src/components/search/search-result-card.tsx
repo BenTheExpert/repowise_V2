@@ -1,6 +1,7 @@
 import Link from "next/link";
-import { Badge } from "@/components/ui/badge";
-import { truncatePath } from "@/lib/utils/format";
+import { Badge } from "@repowise-dev/ui/ui/badge";
+import { truncatePath } from "@repowise-dev/ui/lib/format";
+import { getPageTypeLabel } from "@repowise-dev/ui/lib/page-types";
 import { cn } from "@/lib/utils/cn";
 import type { SearchResultResponse } from "@/lib/api/types";
 
@@ -37,11 +38,11 @@ export function SearchResultCard({ result, query, repoId }: SearchResultCardProp
       className="block rounded-lg border border-[var(--color-border-default)] bg-[var(--color-bg-surface)] p-4 hover:border-[var(--color-border-hover)] hover:bg-[var(--color-bg-elevated)] transition-colors"
     >
       <div className="flex items-start justify-between gap-2 mb-1.5">
-        <h3 className="text-sm font-medium text-[var(--color-text-primary)] truncate">
+        <h3 className="text-sm font-medium text-[var(--color-text-primary)] truncate" title={result.title}>
           {result.title}
         </h3>
         <div className="flex items-center gap-1.5 shrink-0">
-          <Badge variant="default">{result.page_type.replace(/_/g, " ")}</Badge>
+          <Badge variant="default">{getPageTypeLabel(result.page_type)}</Badge>
           <span
             className={cn(
               "inline-flex items-center rounded border px-2 py-0.5 text-xs font-medium tabular-nums",
@@ -56,7 +57,7 @@ export function SearchResultCard({ result, query, repoId }: SearchResultCardProp
           </span>
         </div>
       </div>
-      <p className="text-xs font-mono text-[var(--color-text-tertiary)] mb-2">
+      <p className="text-xs font-mono text-[var(--color-text-tertiary)] mb-2" title={result.target_path}>
         {truncatePath(result.target_path, 60)}
       </p>
       {result.snippet && (

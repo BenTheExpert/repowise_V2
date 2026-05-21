@@ -1,6 +1,7 @@
 import { notFound } from "next/navigation";
 import { listDecisions } from "@/lib/api/decisions";
-import { DecisionsTable } from "@/components/decisions/decisions-table";
+import { ApiClientError } from "@/lib/api/client";
+import { DecisionsTableWrapper } from "@/components/decisions/decisions-table-wrapper";
 
 export const revalidate = 30;
 
@@ -14,8 +15,12 @@ export default async function DecisionsPage({ params }: Props) {
   let decisions;
   try {
     decisions = await listDecisions(repoId, { include_proposed: true, limit: 100 });
-  } catch {
-    notFound();
+  } catch (err) {
+    if (err instanceof ApiClientError && err.status === 404) {
+      notFound();
+    }
+    // Re-throw so the nearest error.tsx boundary can surface a retry UI
+    throw err;
   }
 
   return (
@@ -28,7 +33,7 @@ export default async function DecisionsPage({ params }: Props) {
           Why the codebase is built the way it is — constraints, tradeoffs, and rejected alternatives.
         </p>
       </div>
-      <DecisionsTable repoId={repoId} initialData={decisions} />
+      <DecisionsTableWrapper repoId={repoId} initialData={decisions} />
     </div>
   );
 }
